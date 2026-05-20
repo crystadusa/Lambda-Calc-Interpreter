@@ -1,3 +1,19 @@
+// Includes and binds the tracy profiler for instrumentation
+#ifdef TRACY_ENABLE
+#include "dep/tracy/public/tracy/TracyC.h"
+#define PROFILE_SCOPE() TracyCZone(__profile, 1)
+#define PROFILE_NAMED(name) TracyCZoneN(__profile, name, 1)
+#define PROFILE_CONTEXT(name, context) TracyCZoneN(context, name, 1)
+#define PROFILE_END() TracyCZoneEnd(__profile)
+#define PROFILE_END_CONTEXT(context) TracyCZoneEnd(context)
+#else
+#define PROFILE_SCOPE()
+#define PROFILE_NAMED(name)
+#define PROFILE_CONTEXT(name, context)
+#define PROFILE_END()
+#define PROFILE_END_CONTEXT(context)
+#endif
+
 // Stack allocated space for each memory region
 #define MaxBufferSize 16384
 #define MaxFuncSize 4096
@@ -23,7 +39,9 @@ typedef struct {
     int Index;
 } FuncArg;
 
-void UpdateFuncSize(Func* Output, FuncStack* Funcs, int FuncIndex, FuncArg* FuncInputs, int MaxInputIndex, int FirstIndex, int SizeOffset) {
+static void UpdateFuncSize(Func* Output, FuncStack* Funcs, int FuncIndex, FuncArg* FuncInputs, int MaxInputIndex, int FirstIndex, int SizeOffset) {
+    PROFILE_SCOPE();
+
     // Updates sized terms
 	for (int i = 0; i < FirstIndex; i++)
 		if (Output[i].Size > FirstIndex - i)
@@ -38,9 +56,13 @@ void UpdateFuncSize(Func* Output, FuncStack* Funcs, int FuncIndex, FuncArg* Func
     for (int i = 0; i < MaxInputIndex; i++)
         if (FuncInputs[i].Index > FirstIndex)
             FuncInputs[i].Index += SizeOffset;
+
+    PROFILE_END();
 }
 
-int CallFunc(Func* Called, int CalledCount, Func* Output) {
+static int CallFunc(Func* Called, int CalledCount, Func* Output) {
+    PROFILE_NAMED("Lambda evaluation");
+
     // Copies the input buffer to the output buffer
     if (CalledCount > MaxBufferSize) return 1;
 	for (int i = 0; i < CalledCount; i++)
@@ -68,6 +90,8 @@ int CallFunc(Func* Called, int CalledCount, Func* Output) {
 	for (int i = 0; i < OutputSize || FuncIndex;) {
         // Removes arguments and groupings after parseing a function
     	if (i >= Funcs[FuncIndex].LastIndex) {
+            PROFILE_NAMED("Removeing arguments");
+
             // Calculates the number of preceding groupings ending before or at the end of the current function
             int F = FuncIndex;
             int GroupingCount = F;
@@ -93,23 +117,26 @@ int CallFunc(Func* Called, int CalledCount, Func* Output) {
             }
 
             // Updates size and positions from removing groupings
-            UpdateFuncSize(Output, Funcs, F, FuncInputs, FuncInputIndex, Funcs[F].Index, -GroupingCount);
+            if (GroupingCount) UpdateFuncSize(Output, Funcs, F, FuncInputs, FuncInputIndex, Funcs[F].Index, -GroupingCount);
 
             // Removes groupings and arguments from the output buffer
-            for (int j = Funcs[F].Index; j < i - GroupingCount; j++)
-                Output[j] = Output[j + GroupingCount];
+            if (GroupingCount || i != LastInputIndex) {
+                for (int j = Funcs[F].Index; j < i - GroupingCount; j++)
+                    Output[j] = Output[j + GroupingCount];
 
-            i -= GroupingCount;
-            for (int j = 0; j < OutputSize - LastInputIndex; j++)
-                Output[i + j] = Output[LastInputIndex + j];
+                i -= GroupingCount;
+                for (int j = 0; j < OutputSize - LastInputIndex; j++)
+                    Output[i + j] = Output[LastInputIndex + j];
 
-            OutputSize += i - LastInputIndex;
+                OutputSize += i - LastInputIndex;
+            }
         
             // Restores the previous parseing state
             if (Funcs[FuncIndex].PrevIndex) i = Funcs[FuncIndex].PrevIndex - 1;
 
             FuncIndex -= FuncOffset;
             FuncInputIndex = Funcs[--FuncIndex].ArgumentIndex + Funcs[FuncIndex].InputCount;
+            PROFILE_END();
     	}
     	
         // Reduces bound variables
@@ -153,6 +180,7 @@ int CallFunc(Func* Called, int CalledCount, Func* Output) {
             }
 
             // Arguments applied to previous abstractions are skipped on the next reduction by updating the scoped argument count
+            PROFILE_NAMED("Bound variable evaluation");
             for (int j = F - 1; j && Funcs[j].PrevIndex == 0 && (Funcs[j].InputCount == 0 || FuncInputs[Funcs[j].ArgumentIndex].Index < ArgumentIndex); j--)
                 ScopedOffset += Funcs[j].InputCount;
 
@@ -185,28 +213,37 @@ int CallFunc(Func* Called, int CalledCount, Func* Output) {
                 }
             }
 
-            // Appends the output buffer at the reduction position to the reduction buffer
-            for (int j = 0; j < OutputSize - i - 1; j++)
-                ReductionBuffer[BufferIndex + j] = Output[i + 1 + j];
+            // Moves a term to the reduction position for when the argument is only one term long
+            Output[i] = ReductionBuffer[0];
 
-            OutputSize += SizeOffset;
+            if (SizeOffset) {
+                // Appends the output buffer at the reduction position to the reduction buffer
+                for (int j = 0; j < OutputSize - i - 1; j++)
+                    ReductionBuffer[BufferIndex + j] = Output[i + 1 + j];
 
-            // Moves the reduction buffer to the output buffer at the reduction position
-            for (int j = i; j < OutputSize; j++)
-                Output[j] = ReductionBuffer[j - i];
-        
-            UpdateFuncSize(Output, Funcs, FuncIndex, FuncInputs, FuncInputIndex, i, SizeOffset);
+                OutputSize += SizeOffset;
+
+                // Moves the reduction buffer to the output buffer at the reduction position
+                for (int j = i + 1; j < OutputSize; j++)
+                    Output[j] = ReductionBuffer[j - i];
+            
+                UpdateFuncSize(Output, Funcs, FuncIndex, FuncInputs, FuncInputIndex, i, SizeOffset);
+            }
+            PROFILE_END();
     	}
 
         // Parses groupings
         else if (Output[i].InputID == 0) {
             if (i < Funcs[FuncIndex].LastIndex - 1 && Output[i].Size - 1 == Output[i + 1].Size) {
+                PROFILE_NAMED("Grouping evaluation");
+
                 // Removes groupings when they end where the following sized term ends
                 OutputSize--;
                 for (int j = i; j < OutputSize; j++)
                     Output[j] = Output[j + 1];
 
                 UpdateFuncSize(Output, Funcs, FuncIndex, FuncInputs, FuncInputIndex, i, -1);
+                PROFILE_END();
             } else {
                 // Handles groupings as a function
                 if (++FuncIndex >= MaxFuncSize) return 1;
@@ -241,7 +278,9 @@ int CallFunc(Func* Called, int CalledCount, Func* Output) {
                     i++;
                     break;
                 }
+
             if (NextTerm) continue;
+            PROFILE_NAMED("Abstraction evaluation");
 
             int F = FuncIndex; // Location of the last function that is a sentinel or not a grouping
             while (--F && Funcs[F].PrevIndex == 0 && Funcs[F].InputCount + Output[Funcs[F].Index].InputID == 0);
@@ -291,6 +330,7 @@ int CallFunc(Func* Called, int CalledCount, Func* Output) {
             // Limits the parseing of functions with applications to terminate infinite recursion
             i++;
             if (Funcs[FuncIndex].InputCount && ++AbstractionsParsed >= MaxRecursionSize) return 1;
+            PROFILE_END();
         }
 	}
     
@@ -352,10 +392,12 @@ int CallFunc(Func* Called, int CalledCount, Func* Output) {
 	for (int i = OutputSize; i < MaxBufferSize; i++)
     	Output[i] = (Func) {0};
     	
+    PROFILE_END();
     return 0; // Returns no error code
 }
 
-int main() {
+int main(void) {
+    PROFILE_SCOPE();
 	Func Output [MaxBufferSize];
     
     // Tests removing redundant groupings and abstractions
@@ -461,25 +503,25 @@ int main() {
 		{9, 2}, {1, 0}, {7, 0}, {1, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1},
     };
 	CallFunc(Factorial, sizeof(Factorial) / sizeof(Factorial[0]), Output);
-	
-    // (x, y) = Pair x y, ().0 = () True, ().1 = () False
-    // Factorial = (λn. n (λxf. f (Mult x.0 x.1) (Succ x.1)) (1, 1) True)
-	Func Factorial2 [] = {
-	    {31, 1}, {1, 0}, {19, 2}, {1, 1}, 
-	    {9, 1}, {1, 1}, {2, 2}, {1, 0}, {5, 0}, {1, 1}, {2, 2}, {1, 1}, {1, 0},
-	    {8, 2}, {1, 0}, {6, 0}, {1, 2}, {2, 2}, {1, 1}, {1, 0}, {1, 1},
+    
+    // (x, y) = Pair x y
+    // Factorial = (λn. n (λp. p (λabf. f (Mult a b) (Succ b))) (1, 1) True)
+    Func Factorial2 [] = {
+	    {27, 1}, {1, 0}, {15, 1}, {1, 0}, {13, 3}, {1, 2},
+        {5, 1}, {1, 1}, {3, 0}, {1, 2}, {1, 0},
+        {6, 2}, {1, 0}, {4, 0}, {1, 3}, {1, 0}, {1, 1},
 	    {8, 1}, {1, 0}, {3, 2}, {1, 0}, {1, 1}, {3, 2}, {1, 0}, {1, 1}, {2, 2}, {1, 0},
 		{11, 2}, {1, 0}, {9, 0}, {1, 0}, {7, 0}, {1, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1},
 	};
 	CallFunc(Factorial2, sizeof(Factorial2) / sizeof(Factorial2[0]), Output);
 	
-    // Fibonacci = (λn. n (λxf. f (Plus x.0 x.1) x.0) (1, 0) True)
+    // Fibonacci = (λn. n (λp. p (λabf. f (Plus a b) a)) (1, 0) True)
 	Func Fibonacci [] = {
-	    {28, 1}, {1, 0}, {17, 2}, {1, 1},
-	    {11, 2}, {1, 2}, {2, 2}, {1, 0}, {1, 0}, {6, 0}, {1, 2}, {2, 2}, {1, 1}, {1, 0}, {1, 1},
-	    {4, 0}, {1, 0}, {2, 2}, {1, 0},
+	    {23, 1}, {1, 0}, {12, 1}, {1, 0}, {10, 3}, {1, 2},
+	    {7, 2}, {1, 2}, {1, 0}, {4, 0}, {1, 3}, {1, 0}, {1, 1}, {1, 0},
 	    {7, 1}, {1, 0}, {3, 2}, {1, 0}, {1, 1}, {2, 2}, {1, 1}, {2, 2}, {1, 0},
 	    {13, 2}, {1, 0}, {11, 0}, {1, 0}, {9, 0}, {1, 0}, {7, 0}, {1, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1}
 	};
 	CallFunc(Fibonacci, sizeof(Fibonacci) / sizeof(Fibonacci[0]), Output);
+    PROFILE_END();
 }
