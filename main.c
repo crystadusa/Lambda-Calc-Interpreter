@@ -14,13 +14,45 @@
 #define PROFILE_END_CONTEXT(context)
 #endif
 
-// Stack allocated space for each memory region
-#define MaxBufferSize 16384
-#define MaxFuncSize 4096
-#define MaxStackSize 512
-#define MaxRecursionSize 2048
+// implementation of dynamically sized arrays
+#include <stdlib.h>
 
-// Data layout of custom types
+typedef struct {
+    void* Data;
+    int Size;
+    int Capacity;
+} Array;
+
+#define Array(Type) typedef struct {\
+    Type* Data;\
+    int Size;\
+    int Capacity;\
+} Type##Array
+
+static int ResizeArray(void* DynArray, int Size) {
+    Array* Data = (Array*) 1;
+    Array* Array = DynArray;
+    if (Array->Capacity < Size) {
+        // Doubles capacity or until it can hold the new size
+        PROFILE_SCOPE();
+        Array->Capacity *= 2;
+        if (Array->Capacity < Size) Array->Capacity = Size;
+
+        // Reallocates memory into a larger buffer
+        Data = realloc(Array->Data, Array->Capacity);
+        if (Data) Array->Data = Data;
+        PROFILE_END();
+    }
+
+    // Returns an error code if realloc fails
+    return Data ? 0 : 1;
+}
+
+// Constants to initialize buffers and limit recursion
+#define StartBufferSize 4096
+#define MaxRecursionCount 2048
+
+// Data layout of types for lambda evaluation
 typedef struct {
 	int Size;
 	int InputID; // BoundId when Size is 1 and AbstractionCount otherwise
@@ -39,7 +71,17 @@ typedef struct {
     int Index;
 } FuncArg;
 
-static void UpdateFuncSize(Func* Output, FuncStack* Funcs, int FuncIndex, FuncArg* FuncInputs, int MaxInputIndex, int FirstIndex, int SizeOffset) {
+typedef struct {
+    int ScopeOffset;
+    int OffsetEnd;
+} Abstraction;
+
+Array(Func);
+Array(FuncStack);
+Array(FuncArg);
+Array(Abstraction);
+
+static void UpdateFuncSize(Func* Output, FuncStack* Funcs, int FuncIndex, FuncArg* FuncArgs, int MaxInputIndex, int FirstIndex, int SizeOffset) {
     PROFILE_SCOPE();
 
     // Updates sized terms
@@ -54,204 +96,212 @@ static void UpdateFuncSize(Func* Output, FuncStack* Funcs, int FuncIndex, FuncAr
 
     // Updates argument positions
     for (int i = 0; i < MaxInputIndex; i++)
-        if (FuncInputs[i].Index > FirstIndex)
-            FuncInputs[i].Index += SizeOffset;
+        if (FuncArgs[i].Index > FirstIndex)
+            FuncArgs[i].Index += SizeOffset;
 
     PROFILE_END();
 }
 
-static int CallFunc(Func* Called, int CalledCount, Func* Output) {
+static int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer) {
     PROFILE_NAMED("Lambda evaluation");
+    
+    int ReturnValue = 1;
+    int AbstractionsParsed = 0;
+
+    // Resizes the output buffer to fit the input buffer
+    FuncArray Output = *OutBuffer;
+    if (ResizeArray(&Output, CalledCount * sizeof (Func))) return 1;
+    Output.Size = CalledCount;
 
     // Copies the input buffer to the output buffer
-    if (CalledCount > MaxBufferSize) return 1;
 	for (int i = 0; i < CalledCount; i++)
-    	Output[i] = Called[i];
+    	Output.Data[i] = Called[i];
 
-	int OutputSize = CalledCount;
-    int AbstractionsParsed = 0;
-    int ScopeOffsets[MaxStackSize];
-    int OffsetEnds[MaxStackSize];
-
-    int FuncInputIndex = 0;
-    FuncArg FuncInputs [MaxFuncSize];
-
+    // Allocates memory buffers and returns on failure
+    // Aside from FungArgs, the size field is treated as the last index
+    AbstractionArray Abstractions = {0};
+    FuncArgArray FuncArgs = {0};
+	FuncStackArray Funcs = {0};
+    FuncArray ReductionBuffer = {0};
+    if (ResizeArray(&Abstractions, StartBufferSize) || ResizeArray(&FuncArgs, StartBufferSize) ||
+        ResizeArray(&Funcs, StartBufferSize) || ResizeArray(&ReductionBuffer, StartBufferSize)) goto CallFuncDefer;
+    
     // Initializes a sentinel for function lookups
-    int FuncIndex = 0;
-	FuncStack Funcs [MaxFuncSize];
-    Funcs[0] = (FuncStack) {
+    Funcs.Data[0] = (FuncStack) {
         .Index = 0,
         .InputCount = 0,
         .ArgumentIndex = 0,
-        .LastIndex = OutputSize,
+        .LastIndex = Output.Size,
         .PrevIndex = 0,
     };
 	
-	for (int i = 0; i < OutputSize || FuncIndex;) {
+	for (int i = 0; i < Output.Size || Funcs.Size;) {
         // Removes arguments and groupings after parseing a function
-    	if (i >= Funcs[FuncIndex].LastIndex) {
+    	if (i >= Funcs.Data[Funcs.Size].LastIndex) {
             PROFILE_NAMED("Removeing arguments");
 
             // Calculates the number of preceding groupings ending before or at the end of the current function
-            int F = FuncIndex;
+            int F = Funcs.Size;
             int GroupingCount = F;
-            for (int Index = Funcs[FuncIndex].Index; --Index && Output[Index].Size > 1 && Output[Index].InputID + Funcs[F - 1].InputCount == 0 && i >= Index + Output[Index].Size; F--);
+            for (int Index = Funcs.Data[Funcs.Size].Index; --Index && Output.Data[Index].Size > 1 && Output.Data[Index].InputID + Funcs.Data[F - 1].InputCount == 0 && i >= Index + Output.Data[Index].Size; F--);
             GroupingCount -= F;
 
             // Calculates if the current function is now a grouping ending where the following sized term ends
             int FuncOffset = GroupingCount;
-            int Index = Funcs[FuncIndex].Index;
-            GroupingCount += Output[Index].Size > 1 && Output[Index].InputID == 0 && Output[Index].Size == 1 + Output[Index + 1].Size;
+            int Index = Funcs.Data[Funcs.Size].Index;
+            GroupingCount += Output.Data[Index].Size > 1 && Output.Data[Index].InputID == 0 && Output.Data[Index].Size == 1 + Output.Data[Index + 1].Size;
 
             int LastInputIndex = i;
-            if (Funcs[FuncIndex].InputCount) {
+            if (Funcs.Data[Funcs.Size].InputCount) {
                 // Removes applied variables from earlier abstraction terms
-                LastInputIndex = FuncInputs[FuncInputIndex - 1].Index;
-                for (int j = FuncIndex - 1; j && Funcs[j].PrevIndex == 0 && (Funcs[j].InputCount == 0 || FuncInputs[Funcs[j].ArgumentIndex].Index < LastInputIndex); j--)
-                    Funcs[j].InputCount = 0;
+                LastInputIndex = FuncArgs.Data[FuncArgs.Size - 1].Index;
+                for (int j = Funcs.Size - 1; j && Funcs.Data[j].PrevIndex == 0 && (Funcs.Data[j].InputCount == 0 || FuncArgs.Data[Funcs.Data[j].ArgumentIndex].Index < LastInputIndex); j--)
+                    Funcs.Data[j].InputCount = 0;
 
                 // Updates size and positions from removing arguments
-                LastInputIndex += Output[LastInputIndex].Size;
-                for (int j = i; j < LastInputIndex; j += Output[j].Size)
-                    UpdateFuncSize(Output, Funcs, FuncIndex, FuncInputs, Funcs[FuncIndex].ArgumentIndex, i, -Output[j].Size);
+                LastInputIndex += Output.Data[LastInputIndex].Size;
+                for (int j = i; j < LastInputIndex; j += Output.Data[j].Size)
+                    UpdateFuncSize(Output.Data, Funcs.Data, Funcs.Size, FuncArgs.Data, Funcs.Data[Funcs.Size].ArgumentIndex, i, -Output.Data[j].Size);
             }
 
             // Updates size and positions from removing groupings
-            if (GroupingCount) UpdateFuncSize(Output, Funcs, F, FuncInputs, FuncInputIndex, Funcs[F].Index, -GroupingCount);
+            if (GroupingCount) UpdateFuncSize(Output.Data, Funcs.Data, F, FuncArgs.Data, FuncArgs.Size, Funcs.Data[F].Index, -GroupingCount);
 
             // Removes groupings and arguments from the output buffer
             if (GroupingCount || i != LastInputIndex) {
-                for (int j = Funcs[F].Index; j < i - GroupingCount; j++)
-                    Output[j] = Output[j + GroupingCount];
+                for (int j = Funcs.Data[F].Index; j < i - GroupingCount; j++)
+                    Output.Data[j] = Output.Data[j + GroupingCount];
 
                 i -= GroupingCount;
-                for (int j = 0; j < OutputSize - LastInputIndex; j++)
-                    Output[i + j] = Output[LastInputIndex + j];
+                for (int j = 0; j < Output.Size - LastInputIndex; j++)
+                    Output.Data[i + j] = Output.Data[LastInputIndex + j];
 
-                OutputSize += i - LastInputIndex;
+                Output.Size += i - LastInputIndex;
             }
         
             // Restores the previous parseing state
-            if (Funcs[FuncIndex].PrevIndex) i = Funcs[FuncIndex].PrevIndex - 1;
+            if (Funcs.Data[Funcs.Size].PrevIndex) i = Funcs.Data[Funcs.Size].PrevIndex - 1;
 
-            FuncIndex -= FuncOffset;
-            FuncInputIndex = Funcs[--FuncIndex].ArgumentIndex + Funcs[FuncIndex].InputCount;
+            Funcs.Size -= FuncOffset;
+            FuncArgs.Size = Funcs.Data[--Funcs.Size].ArgumentIndex + Funcs.Data[Funcs.Size].InputCount;
             PROFILE_END();
     	}
     	
         // Reduces bound variables
-    	else if (Output[i].Size < 2) {
+    	else if (Output.Data[i].Size < 2) {
             // Determines the number of applied and unapplied variables
             // Stops counting when detecting a sentinel value or the current variable is bound to an abstraction
-            int F = FuncIndex + 1;
+            int F = Funcs.Size + 1;
             int AppliedOffset = 0;
             int ScopedOffset = 0;
             do {
-                AppliedOffset += Funcs[--F].InputCount;
-                ScopedOffset += Output[Funcs[F].Index].InputID;
-             } while (F && Funcs[F].PrevIndex == 0 && (AppliedOffset + ScopedOffset <= Output[i].InputID || Funcs[F].InputCount + Output[Funcs[F].Index].InputID == 0));
+                AppliedOffset += Funcs.Data[--F].InputCount;
+                ScopedOffset += Output.Data[Funcs.Data[F].Index].InputID;
+             } while (F && Funcs.Data[F].PrevIndex == 0 && (AppliedOffset + ScopedOffset <= Output.Data[i].InputID || Funcs.Data[F].InputCount + Output.Data[Funcs.Data[F].Index].InputID == 0));
             ScopedOffset += AppliedOffset;
 
             // Detects sentinel values for unapplied bound variables and free variables
             // These cannot be reduced so the applied variable count decreases their bound ID instead
-            int BoundID = Output[i].InputID - ScopedOffset + Output[Funcs[F].Index].InputID + Funcs[F].InputCount;
-            if (F == 0 || Funcs[F].PrevIndex || BoundID >= Funcs[F].InputCount) {
-                Output[i++].InputID -= AppliedOffset;
+            int BoundID = Output.Data[i].InputID - ScopedOffset + Output.Data[Funcs.Data[F].Index].InputID + Funcs.Data[F].InputCount;
+            if (F == 0 || Funcs.Data[F].PrevIndex || BoundID >= Funcs.Data[F].InputCount) {
+                Output.Data[i++].InputID -= AppliedOffset;
                 continue;
             }
 
             // The lazy reduction strategy parses arguments right before reduction
-            int ArgumentIndex = FuncInputs[Funcs[F].ArgumentIndex + BoundID].Index;
-            if (FuncInputs[Funcs[F].ArgumentIndex + BoundID].IsReduced == 0) {
+            int ArgumentIndex = FuncArgs.Data[Funcs.Data[F].ArgumentIndex + BoundID].Index;
+            if (FuncArgs.Data[Funcs.Data[F].ArgumentIndex + BoundID].IsReduced == 0) {
                 // The previous index is a sentinel that stores the reduction position
-                if (++FuncIndex >= MaxFuncSize) return 1;
-                Funcs[FuncIndex] = (FuncStack) {
+                if (ResizeArray(&Funcs, (++Funcs.Size + 1) * sizeof (FuncStack))) goto CallFuncDefer;
+                Funcs.Data[Funcs.Size] = (FuncStack) {
                     .Index = ArgumentIndex,
                     .InputCount = 0,
-                    .ArgumentIndex = FuncInputIndex,
-                    .LastIndex = ArgumentIndex + Output[ArgumentIndex].Size,
+                    .ArgumentIndex = FuncArgs.Size,
+                    .LastIndex = ArgumentIndex + Output.Data[ArgumentIndex].Size,
                     .PrevIndex = i + 1,
                 };
 
                 // Marks the selected argument as reduced before parsing
-                FuncInputs[Funcs[F].ArgumentIndex + BoundID].IsReduced = 1;
+                FuncArgs.Data[Funcs.Data[F].ArgumentIndex + BoundID].IsReduced = 1;
                 i = ArgumentIndex;
                 continue;
             }
 
             // Arguments applied to previous abstractions are skipped on the next reduction by updating the scoped argument count
             PROFILE_NAMED("Bound variable evaluation");
-            for (int j = F - 1; j && Funcs[j].PrevIndex == 0 && (Funcs[j].InputCount == 0 || FuncInputs[Funcs[j].ArgumentIndex].Index < ArgumentIndex); j--)
-                ScopedOffset += Funcs[j].InputCount;
+            for (int j = F - 1; j && Funcs.Data[j].PrevIndex == 0 && (Funcs.Data[j].InputCount == 0 || FuncArgs.Data[Funcs.Data[j].ArgumentIndex].Index < ArgumentIndex); j--)
+                ScopedOffset += Funcs.Data[j].InputCount;
 
             // Applies a beta reduction
             int BufferIndex = 0;
-            Func ReductionBuffer [MaxBufferSize];
-
             int StackIndex = 0;
-            ScopeOffsets[0] = 0;
-            OffsetEnds[0] = ArgumentIndex + Output[ArgumentIndex].Size;
+            Abstractions.Data[0] = (Abstraction) {
+                .ScopeOffset = 0,
+                .OffsetEnd = ArgumentIndex + Output.Data[ArgumentIndex].Size
+            };
 
-            int SizeOffset = Output[ArgumentIndex].Size - 1;
-            if (OutputSize + SizeOffset > MaxBufferSize) return 1;
+            // Resizes the output and reduction buffers to fit the reduced argument
+            int SizeOffset = Output.Data[ArgumentIndex].Size - 1;
+            if (ResizeArray(&Output, (Output.Size + SizeOffset) * sizeof (Func))) goto CallFuncDefer;
+            if (ResizeArray(&ReductionBuffer, (SizeOffset + Output.Size - i) * sizeof (Func))) goto CallFuncDefer;
 
-            for (int j = ArgumentIndex; j < ArgumentIndex + Output[ArgumentIndex].Size; j++) {
+            for (int j = ArgumentIndex; j < ArgumentIndex + Output.Data[ArgumentIndex].Size; j++) {
                 // Decreases the scope offset at the end of an abstraction
-                while (j >= OffsetEnds[StackIndex])
+                while (j >= Abstractions.Data[StackIndex].OffsetEnd)
                     StackIndex--;
 
                 // Use the scoped argument count to increase bound IDs for variables that are free or bounded outside the current abstraction
-                ReductionBuffer[BufferIndex++] = Output[j];
-                if (Output[j].Size == 1 && Output[j].InputID >= ScopeOffsets[StackIndex])
-                    ReductionBuffer[BufferIndex - 1].InputID += ScopedOffset;
+                ReductionBuffer.Data[BufferIndex++] = Output.Data[j];
+                if (Output.Data[j].Size == 1 && Output.Data[j].InputID >= Abstractions.Data[StackIndex].ScopeOffset)
+                    ReductionBuffer.Data[BufferIndex - 1].InputID += ScopedOffset;
                 
                 // Increases the scope offset when parseing an abstraction
-                else if (Output[j].InputID) {
-                    if (++StackIndex >= MaxStackSize) return 1;
-                    ScopeOffsets[StackIndex] = ScopeOffsets[StackIndex - 1] + Output[j].InputID;
-                    OffsetEnds[StackIndex] = j + Output[j].Size;
+                else if (Output.Data[j].InputID) {
+                    if (ResizeArray(&Abstractions, (++StackIndex + 1) * sizeof (Abstraction))) goto CallFuncDefer;
+                    Abstractions.Data[StackIndex].ScopeOffset = Abstractions.Data[StackIndex - 1].ScopeOffset + Output.Data[j].InputID;
+                    Abstractions.Data[StackIndex].OffsetEnd = j + Output.Data[j].Size;
                 }
             }
 
             // Moves a term to the reduction position for when the argument is only one term long
-            Output[i] = ReductionBuffer[0];
+            Output.Data[i] = ReductionBuffer.Data[0];
 
             if (SizeOffset) {
                 // Appends the output buffer at the reduction position to the reduction buffer
-                for (int j = 0; j < OutputSize - i - 1; j++)
-                    ReductionBuffer[BufferIndex + j] = Output[i + 1 + j];
+                for (int j = 0; j < Output.Size - i - 1; j++)
+                    ReductionBuffer.Data[BufferIndex + j] = Output.Data[i + 1 + j];
 
-                OutputSize += SizeOffset;
+                Output.Size += SizeOffset;
 
                 // Moves the reduction buffer to the output buffer at the reduction position
-                for (int j = i + 1; j < OutputSize; j++)
-                    Output[j] = ReductionBuffer[j - i];
+                for (int j = i + 1; j < Output.Size; j++)
+                    Output.Data[j] = ReductionBuffer.Data[j - i];
             
-                UpdateFuncSize(Output, Funcs, FuncIndex, FuncInputs, FuncInputIndex, i, SizeOffset);
+                UpdateFuncSize(Output.Data, Funcs.Data, Funcs.Size, FuncArgs.Data, FuncArgs.Size, i, SizeOffset);
             }
             PROFILE_END();
     	}
 
         // Parses groupings
-        else if (Output[i].InputID == 0) {
-            if (i < Funcs[FuncIndex].LastIndex - 1 && Output[i].Size - 1 == Output[i + 1].Size) {
+        else if (Output.Data[i].InputID == 0) {
+            if (i < Funcs.Data[Funcs.Size].LastIndex - 1 && Output.Data[i].Size - 1 == Output.Data[i + 1].Size) {
                 PROFILE_NAMED("Grouping evaluation");
 
                 // Removes groupings when they end where the following sized term ends
-                OutputSize--;
-                for (int j = i; j < OutputSize; j++)
-                    Output[j] = Output[j + 1];
+                Output.Size--;
+                for (int j = i; j < Output.Size; j++)
+                    Output.Data[j] = Output.Data[j + 1];
 
-                UpdateFuncSize(Output, Funcs, FuncIndex, FuncInputs, FuncInputIndex, i, -1);
+                UpdateFuncSize(Output.Data, Funcs.Data, Funcs.Size, FuncArgs.Data, FuncArgs.Size, i, -1);
                 PROFILE_END();
             } else {
                 // Handles groupings as a function
-                if (++FuncIndex >= MaxFuncSize) return 1;
-                Funcs[FuncIndex] = (FuncStack) {
+                if (ResizeArray(&Funcs, (++Funcs.Size + 1) * sizeof (FuncStack))) goto CallFuncDefer;
+                Funcs.Data[Funcs.Size] = (FuncStack) {
                     .Index = i,
                     .InputCount = 0,
-                    .ArgumentIndex = FuncInputIndex,
-                    .LastIndex = i + Output[i].Size,
+                    .ArgumentIndex = FuncArgs.Size,
+                    .LastIndex = i + Output.Data[i].Size,
                     .PrevIndex = 0,
                 };
                 i++;
@@ -261,19 +311,19 @@ static int CallFunc(Func* Called, int CalledCount, Func* Output) {
         // Applies bound variables in abstractions
         else {
             // Initializes a function without bound variables
-            if (++FuncIndex >= MaxFuncSize) return 1;
-            Funcs[FuncIndex] = (FuncStack) {
+            if (ResizeArray(&Funcs, (++Funcs.Size + 1) * sizeof (FuncStack))) goto CallFuncDefer;
+            Funcs.Data[Funcs.Size] = (FuncStack) {
                 .Index = i,
                 .InputCount = 0,
-                .ArgumentIndex = FuncInputIndex,
-                .LastIndex = i + Output[i].Size,
+                .ArgumentIndex = FuncArgs.Size,
+                .LastIndex = i + Output.Data[i].Size,
                 .PrevIndex = 0,
             };
 
             // Potential arguments cannot reduce bound variables
             int NextTerm = 0;
-            for (int j = Funcs[FuncIndex - 1].Index; j < i; j++)
-                if (Output[j].Size < 2) {
+            for (int j = Funcs.Data[Funcs.Size - 1].Index; j < i; j++)
+                if (Output.Data[j].Size < 2) {
                     NextTerm = 1;
                     i++;
                     break;
@@ -282,30 +332,30 @@ static int CallFunc(Func* Called, int CalledCount, Func* Output) {
             if (NextTerm) continue;
             PROFILE_NAMED("Abstraction evaluation");
 
-            int F = FuncIndex; // Location of the last function that is a sentinel or not a grouping
-            while (--F && Funcs[F].PrevIndex == 0 && Funcs[F].InputCount + Output[Funcs[F].Index].InputID == 0);
+            int F = Funcs.Size; // Location of the last function that is a sentinel or not a grouping
+            while (--F && Funcs.Data[F].PrevIndex == 0 && Funcs.Data[F].InputCount + Output.Data[Funcs.Data[F].Index].InputID == 0);
                 
-            for (int I = i; Output[i].InputID;) {
+            for (int I = i; Output.Data[i].InputID;) {
                 // Cannot update the current function with arguments of previously applied functions
-                if (I + Output[I].Size >= Funcs[F].LastIndex) {
+                if (I + Output.Data[I].Size >= Funcs.Data[F].LastIndex) {
                     int ArgumentCount = 0;
                     do {
-                        if (I + Output[I].Size >= Funcs[F].LastIndex) {
-                            ArgumentCount += Funcs[F].InputCount;
+                        if (I + Output.Data[I].Size >= Funcs.Data[F].LastIndex) {
+                            ArgumentCount += Funcs.Data[F].InputCount;
 
                             // Cannot apply arguments that do not exist or are outside the range of an known or potential argument
-                            if (F == 0 || Funcs[F].PrevIndex || Funcs[F].InputCount == 0 && Output[Funcs[F].Index].InputID) {
+                            if (F == 0 || Funcs.Data[F].PrevIndex || Funcs.Data[F].InputCount == 0 && Output.Data[Funcs.Data[F].Index].InputID) {
                                 NextTerm = 1;
                                 break;
                             }
 
                             // Finds location of the previous function that is a sentinel or not a grouping
-                            while (--F && Funcs[F].PrevIndex == 0 && Funcs[F].InputCount + Output[Funcs[F].Index].InputID == 0);
+                            while (--F && Funcs.Data[F].PrevIndex == 0 && Funcs.Data[F].InputCount + Output.Data[Funcs.Data[F].Index].InputID == 0);
                             continue;
                         }
 
                         // Updates the current argument index for past arguments
-                        I += Output[I].Size;
+                        I += Output.Data[I].Size;
                         ArgumentCount--;
                     } while (ArgumentCount);
 
@@ -315,13 +365,13 @@ static int CallFunc(Func* Called, int CalledCount, Func* Output) {
                 }
 
                 // Updates the current argument index and application counts
-                I += Output[I].Size;
-                Output[i].InputID--;
-                Funcs[FuncIndex].InputCount++;
+                I += Output.Data[I].Size;
+                Output.Data[i].InputID--;
+                Funcs.Data[Funcs.Size].InputCount++;
 
                 // Appends the unreduced status to the argument buffer
-                if (FuncInputIndex >= MaxFuncSize) return 1;
-                FuncInputs[FuncInputIndex++] = (FuncArg) {
+                if (ResizeArray(&FuncArgs, (FuncArgs.Size + 1) * sizeof (FuncArg))) goto CallFuncDefer;
+                FuncArgs.Data[FuncArgs.Size++] = (FuncArg) {
                     .IsReduced = 0,
                     .Index = I
                 };
@@ -329,100 +379,110 @@ static int CallFunc(Func* Called, int CalledCount, Func* Output) {
             
             // Limits the parseing of functions with applications to terminate infinite recursion
             i++;
-            if (Funcs[FuncIndex].InputCount && ++AbstractionsParsed >= MaxRecursionSize) return 1;
+            if (Funcs.Data[Funcs.Size].InputCount && ++AbstractionsParsed >= MaxRecursionCount) goto CallFuncDefer;
             PROFILE_END();
         }
 	}
     
     // Removes groupings following a sized term
-	for (int i = 0; i < OutputSize;)
-       	if ((i == 0 || Output[i - 1].Size != 1) && Output[i].Size != 1 && Output[i].InputID == 0) {
-        	OutputSize--;
-        	for (int j = i; j < OutputSize; j++)
-            	Output[j] = Output[j + 1];
+	for (int i = 0; i < Output.Size;)
+       	if ((i == 0 || Output.Data[i - 1].Size != 1) && Output.Data[i].Size != 1 && Output.Data[i].InputID == 0) {
+        	Output.Size--;
+        	for (int j = i; j < Output.Size; j++)
+            	Output.Data[j] = Output.Data[j + 1];
           	 
            	for (int j = 0; j < i; j++)
-            	if (Output[j].Size > i - j)
-                	Output[j].Size--;
+            	if (Output.Data[j].Size > i - j)
+                	Output.Data[j].Size--;
     	} else i++;
     
     // Combines abstractions when they end where the following abstraction ends
-	for (int i = 0; i < OutputSize - 1;)
-       	if (Output[i + 1].Size != 1 && Output[i].InputID && Output[i + 1].InputID && Output[i].Size - 1 == Output[i + 1].Size) {
+	for (int i = 0; i < Output.Size - 1;)
+       	if (Output.Data[i + 1].Size != 1 && Output.Data[i].InputID && Output.Data[i + 1].InputID && Output.Data[i].Size - 1 == Output.Data[i + 1].Size) {
            	int StackIndex = 0;
-        	ScopeOffsets[0] = 0;
-        	OffsetEnds[0] = i + Output[i].Size;
-       	 
-            int TotalBounds = Output[i].InputID + Output[i + 1].InputID;
-        	for (int j = i + 2; j < OutputSize; j++) {
+            Abstractions.Data[0] = (Abstraction) {
+                .ScopeOffset = 0,
+                .OffsetEnd = i + Output.Data[i].Size
+            };
+
+            int TotalBounds = Output.Data[i].InputID + Output.Data[i + 1].InputID;
+        	for (int j = i + 2; j < Output.Size; j++) {
                 // Decreases the scope offset at the end of an abstraction
-            	while (j >= OffsetEnds[StackIndex])
+            	while (j >= Abstractions.Data[StackIndex].OffsetEnd)
             	    StackIndex--;
                	 
                 // Decreases the bound ID for variables bound to the first abstraction and decreases it for those bound to the following one
                 // For the reason that bound IDs are relative to the innermost abstraction
-            	if (Output[j].Size == 1 && Output[j].InputID - ScopeOffsets[StackIndex] < TotalBounds && Output[j].InputID >= ScopeOffsets[StackIndex])
-                    if (Output[j].InputID - ScopeOffsets[StackIndex] >= Output[i + 1].InputID)
-                        Output[j].InputID -= Output[i + 1].InputID;
-                    else Output[j].InputID += Output[i].InputID;
+            	if (Output.Data[j].Size == 1 && Output.Data[j].InputID - Abstractions.Data[StackIndex].ScopeOffset < TotalBounds && Output.Data[j].InputID >= Abstractions.Data[StackIndex].ScopeOffset)
+                    if (Output.Data[j].InputID - Abstractions.Data[StackIndex].ScopeOffset >= Output.Data[i + 1].InputID)
+                        Output.Data[j].InputID -= Output.Data[i + 1].InputID;
+                    else Output.Data[j].InputID += Output.Data[i].InputID;
                 
                 // Increases the scope offset when parseing an abstraction
-            	else if (Output[j].InputID) {
-                	if (++StackIndex >= MaxStackSize) return 1;
-                	ScopeOffsets[StackIndex] = ScopeOffsets[StackIndex - 1] + Output[j].InputID;
-                	OffsetEnds[StackIndex] = j + Output[j].Size;
+            	else if (Output.Data[j].InputID) {
+                    if (ResizeArray(&Abstractions, (++StackIndex + 1) * sizeof (Abstraction))) goto CallFuncDefer;
+                	Abstractions.Data[StackIndex].ScopeOffset = Abstractions.Data[StackIndex - 1].ScopeOffset + Output.Data[j].InputID;
+                	Abstractions.Data[StackIndex].OffsetEnd = j + Output.Data[j].Size;
             	}
         	}
 
             // Combines two abstraction terms into one
-        	Output[i].Size--;
-        	Output[i].InputID = TotalBounds;
+        	Output.Data[i].Size--;
+        	Output.Data[i].InputID = TotalBounds;
    	 
             // Removes the remaining abstraction term
-        	OutputSize--;
-        	for (int j = i + 1; j < OutputSize; j++)
-            	Output[j] = Output[j + 1];
+        	Output.Size--;
+        	for (int j = i + 1; j < Output.Size; j++)
+            	Output.Data[j] = Output.Data[j + 1];
           	 
            	for (int j = 0; j < i; j++)
-            	if (Output[j].Size > i - j)
-                	Output[j].Size--;
+            	if (Output.Data[j].Size > i - j)
+                	Output.Data[j].Size--;
     	} else i++;
+    
+    ReturnValue = 0;
 
-    // Fills the remaining output buffer with null terms
-	for (int i = OutputSize; i < MaxBufferSize; i++)
-    	Output[i] = (Func) {0};
-    	
+    // Frees memory buffers
+    CallFuncDefer: 
+    free(ReductionBuffer.Data);
+    free(Abstractions.Data);
+    free(FuncArgs.Data);
+    free(Funcs.Data);
+
+    // Returns the error code and output buffer
+    *OutBuffer = Output;
     PROFILE_END();
-    return 0; // Returns no error code
+    return ReturnValue;
 }
 
 int main(void) {
     PROFILE_SCOPE();
-	Func Output [MaxBufferSize];
+    FuncArray Output = {0};
+    if (ResizeArray(&Output, StartBufferSize)) return 1;
     
     // Tests removing redundant groupings and abstractions
 	Func ReduceGroupings [] = {{10, 0}, {1, 0}, {8, 1}, {7, 0}, {1, 2}, {5, 1}, {1, 3}, {3, 0}, {1, 4}, {1, 5}};
-	CallFunc(ReduceGroupings, sizeof(ReduceGroupings) / sizeof(ReduceGroupings[0]), Output);
+	CallFunc(ReduceGroupings, sizeof(ReduceGroupings) / sizeof(ReduceGroupings[0]), &Output);
 
 	Func ReduceAbstractions [] = {{16, 3}, {15, 2}, {14, 2}, {1, 4}, {1, 3}, {1, 7}, {10, 2}, {1, 1}, {1, 6}, {1, 5}, {1, 9}, {5, 1}, {1, 0}, {1, 7}, {1, 6}, {1, 10}};
-	CallFunc(ReduceAbstractions, sizeof(ReduceAbstractions) / sizeof(ReduceAbstractions[0]), Output);
+	CallFunc(ReduceAbstractions, sizeof(ReduceAbstractions) / sizeof(ReduceAbstractions[0]), &Output);
 
     // True = (λxy. x), False = (λxy. y)
 	Func False [] = {{2, 2}, {1, 1}, {1, 0}, {3, 0}, {2, 2}, {1, 1}};
-	CallFunc(False, sizeof(False) / sizeof(False[0]), Output);
+	CallFunc(False, sizeof(False) / sizeof(False[0]), &Output);
 
     // Not = (λp. p False True)
 	Func Not [] = {{6, 1}, {1, 0}, {2, 2}, {1, 1}, {2, 2}, {1, 0}, {2, 2}, {1, 0}};
-	CallFunc(Not, sizeof(Not) / sizeof(Not[0]), Output);
+	CallFunc(Not, sizeof(Not) / sizeof(Not[0]), &Output);
 
     // Succ = (λnfx. f (n f x))
     // Zero = (λfx. x), One = (λfx. f x), Two = (λfx. f (f x))...
-	Func Succ [MaxBufferSize] = {{6, 3}, {1, 1}, {4, 0}, {1, 0}, {1, 1}, {1, 2}};
+	Func Succ [32] = {{6, 3}, {1, 1}, {4, 0}, {1, 0}, {1, 1}, {1, 2}};
 	for (int i = 0; i < 7; i++) {
     	int j = 0;
-    	for (; j < Output[0].Size; j++)
-        	Succ[6 + j] = Output[j];
-    	CallFunc(Succ, 6 + j, Output);
+    	for (; j < Output.Data[0].Size; j++)
+        	Succ[6 + j] = Output.Data[j];
+    	CallFunc(Succ, 6 + j, &Output);
 	}
     
     // Plus = (λmn. m Succ n)
@@ -431,7 +491,7 @@ int main(void) {
     	{10, 2}, {1, 0}, {8, 0}, {1, 0}, {6, 0}, {1, 0}, {4, 0}, {1, 0}, {2, 0}, {1, 1},
     	{6, 2}, {1, 0}, {4, 0}, {1, 0}, {2, 0}, {1, 1}
 	};
-	CallFunc(Plus, sizeof(Plus) / sizeof(Plus[0]), Output);
+	CallFunc(Plus, sizeof(Plus) / sizeof(Plus[0]), &Output);
     
     // Plus = (λmnfx. m f (n f x))
 	Func Plus2 [] = {
@@ -439,7 +499,7 @@ int main(void) {
     	{8, 2}, {1, 0}, {6, 0}, {1, 0}, {4, 0}, {1, 0}, {2, 0}, {1, 1},
     	{8, 2}, {1, 0}, {6, 0}, {1, 0}, {4, 0}, {1, 0}, {2, 0}, {1, 1}
 	};
-	CallFunc(Plus2, sizeof(Plus2) / sizeof(Plus2[0]), Output);
+	CallFunc(Plus2, sizeof(Plus2) / sizeof(Plus2[0]), &Output);
     
     // Mult = (λmn. m (PLUS n) 0)
 	Func Times [] = {
@@ -447,7 +507,7 @@ int main(void) {
     	{6, 2}, {1, 0}, {4, 0}, {1, 0}, {2, 0}, {1, 1},
     	{6, 2}, {1, 0}, {4, 0}, {1, 0}, {2, 0}, {1, 1}
 	};
-	CallFunc(Times, sizeof(Times) / sizeof(Times[0]), Output);
+	CallFunc(Times, sizeof(Times) / sizeof(Times[0]), &Output);
     
     // Mult = (λmnf. m (n f))
 	Func Times2 [] = {
@@ -455,16 +515,16 @@ int main(void) {
     	{8, 2}, {1, 0}, {6, 0}, {1, 0}, {4, 0}, {1, 0}, {2, 0}, {1, 1},
     	{8, 2}, {1, 0}, {6, 0}, {1, 0}, {4, 0}, {1, 0}, {2, 0}, {1, 1}
 	};
-	CallFunc(Times2, sizeof(Times2) / sizeof(Times2[0]), Output);
+	CallFunc(Times2, sizeof(Times2) / sizeof(Times2[0]), &Output);
 
     // Pred = (λnfx. n (λgh. h (g f)) (λu. x) (λu. u))
     // Sub (m - n) = (λmn. m Pred n)
-    Func Pred [] = {
+    Func Sub [] = {
         {14, 2}, {1, 0}, {11, 3}, {1, 0}, {5, 2}, {1, 1}, {3, 0}, {1, 0}, {1, 3}, {2, 1}, {1, 3}, {2, 1}, {1, 0}, {1, 1},
 		{5, 2}, {1, 0}, {3, 0}, {1, 0}, {1, 1},
     	{9, 2}, {1, 0}, {7, 0}, {1, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1}
     };
-	CallFunc(Pred, sizeof(Pred) / sizeof(Pred[0]), Output);
+	CallFunc(Sub, sizeof(Sub) / sizeof(Sub[0]), &Output);
 
     // IsZero = (λn. n (λx. False) True)
     // Leq = (λmn. IsZero (Sub m n))
@@ -476,7 +536,7 @@ int main(void) {
 		{5, 2}, {1, 0}, {3, 0}, {1, 0}, {1, 1},
 		{9, 2}, {1, 0}, {7, 0}, {1, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1},
 	};
-	CallFunc(Equal, sizeof(Equal) / sizeof(Equal[0]), Output);
+	CallFunc(Equal, sizeof(Equal) / sizeof(Equal[0]), &Output);
 	
     // Pair = (λxyf. f x y)
     // {} = Nil = False
@@ -490,7 +550,7 @@ int main(void) {
 		{5, 2}, {1, 0}, {3, 0}, {1, 0}, {1, 1},
 	    {12, 1}, {1, 0}, {1, 1}, {9, 1}, {1, 0}, {1, 2}, {6, 1}, {1, 0}, {1, 3}, {3, 1}, {1, 0}, {1, 4}
 	};
-	CallFunc(Skip, sizeof(Skip) / sizeof(Skip[0]), Output);
+	CallFunc(Skip, sizeof(Skip) / sizeof(Skip[0]), &Output);
 	
 	// Factorial = Y F
 	// Y = (λg. (λx. g (x x)) (λx. g (x x)))
@@ -502,7 +562,7 @@ int main(void) {
         {11, 3}, {1, 0}, {5, 2}, {1, 1}, {3, 0}, {1, 0}, {1, 3}, {2, 1}, {1, 3}, {2, 1}, {1, 0}, {1, 1},
 		{9, 2}, {1, 0}, {7, 0}, {1, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1},
     };
-	CallFunc(Factorial, sizeof(Factorial) / sizeof(Factorial[0]), Output);
+	CallFunc(Factorial, sizeof(Factorial) / sizeof(Factorial[0]), &Output);
     
     // (x, y) = Pair x y
     // Factorial = (λn. n (λp. p (λabf. f (Mult a b) (Succ b))) (1, 1) True)
@@ -513,7 +573,7 @@ int main(void) {
 	    {8, 1}, {1, 0}, {3, 2}, {1, 0}, {1, 1}, {3, 2}, {1, 0}, {1, 1}, {2, 2}, {1, 0},
 		{11, 2}, {1, 0}, {9, 0}, {1, 0}, {7, 0}, {1, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1},
 	};
-	CallFunc(Factorial2, sizeof(Factorial2) / sizeof(Factorial2[0]), Output);
+	CallFunc(Factorial2, sizeof(Factorial2) / sizeof(Factorial2[0]), &Output);
 	
     // Fibonacci = (λn. n (λp. p (λabf. f (Plus a b) a)) (1, 0) True)
 	Func Fibonacci [] = {
@@ -522,6 +582,8 @@ int main(void) {
 	    {7, 1}, {1, 0}, {3, 2}, {1, 0}, {1, 1}, {2, 2}, {1, 1}, {2, 2}, {1, 0},
 	    {13, 2}, {1, 0}, {11, 0}, {1, 0}, {9, 0}, {1, 0}, {7, 0}, {1, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1}
 	};
-	CallFunc(Fibonacci, sizeof(Fibonacci) / sizeof(Fibonacci[0]), Output);
+	CallFunc(Fibonacci, sizeof(Fibonacci) / sizeof(Fibonacci[0]), &Output);
+
     PROFILE_END();
+    return 0;
 }
