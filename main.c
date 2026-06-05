@@ -50,7 +50,7 @@ static int ResizeArray(void* DynArray, int Size) {
 
 // Constants to initialize buffers and limit recursion
 #define StartBufferSize 4096
-#define MaxRecursionCount 2048
+#define MaxRecursionCount 4096
 
 // Data layout of types for lambda evaluation
 typedef struct {
@@ -107,6 +107,7 @@ static int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer) {
     
     int ReturnValue = 1;
     int AbstractionsParsed = 0;
+    int PostFreeVariable = 0;
 
     // Resizes the output buffer to fit the input buffer
     FuncArray Output = *OutBuffer;
@@ -118,7 +119,7 @@ static int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer) {
     	Output.Data[i] = Called[i];
 
     // Allocates memory buffers and returns on failure
-    // Aside from FungArgs, the size field is treated as the last index
+    // Aside from FuncArgs, the size field is treated as the last index
     AbstractionArray Abstractions = {0};
     FuncArgArray FuncArgs = {0};
 	FuncStackArray Funcs = {0};
@@ -180,14 +181,17 @@ static int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer) {
             }
         
             // Restores the previous parseing state
-            if (Funcs.Data[Funcs.Size].PrevIndex) i = Funcs.Data[Funcs.Size].PrevIndex - 1;
+            if (Funcs.Data[Funcs.Size].PrevIndex) {
+                i = Funcs.Data[Funcs.Size].PrevIndex - 1;
+                PostFreeVariable = 0;
+            }
 
             Funcs.Size -= FuncOffset;
             FuncArgs.Size = Funcs.Data[--Funcs.Size].ArgumentIndex + Funcs.Data[Funcs.Size].InputCount;
             PROFILE_END();
     	}
     	
-        // Reduces bound variables
+        // Parses variables
     	else if (Output.Data[i].Size < 2) {
             // Determines the number of applied and unapplied variables
             // Stops counting when detecting a sentinel value or the current variable is bound to an abstraction
@@ -201,10 +205,75 @@ static int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer) {
             ScopedOffset += AppliedOffset;
 
             // Detects sentinel values for unapplied bound variables and free variables
-            // These cannot be reduced so the applied variable count decreases their bound ID instead
             int BoundID = Output.Data[i].InputID - ScopedOffset + Output.Data[Funcs.Data[F].Index].InputID + Funcs.Data[F].InputCount;
             if (F == 0 || Funcs.Data[F].PrevIndex || BoundID >= Funcs.Data[F].InputCount) {
-                Output.Data[i++].InputID -= AppliedOffset;
+                // Unapplied bound variables cannot be reduced so the applied variable count decreases their bound ID instead
+                // Free variables do not need separate parseing when not evaluating arguments
+                if (Funcs.Data[F].PrevIndex == 0) {
+                    Output.Data[i++].InputID -= AppliedOffset;
+                    continue;
+                }
+
+                // Potential arguments do not need to be removed again
+                if (PostFreeVariable) {
+                    i++;
+                    continue;
+                }
+
+                // Finds the last function that is not a grouping
+                PROFILE_NAMED("Free variable evaluation");
+                int LastF = Funcs.Size;
+                while (LastF && Funcs.Data[LastF].PrevIndex == 0 && Funcs.Data[LastF].InputCount + Output.Data[Funcs.Data[LastF].Index].InputID == 0) LastF--;
+
+                // Free variables may later become bound when evaluating arguments
+                // So Input IDs must be updated to remove potential arguments from functions
+                int StackIndex = 0;
+                Abstractions.Data[0] = (Abstraction) {
+                    .ScopeOffset = 0,
+                    .OffsetEnd = i
+                };
+
+                int F2 = F;
+                for (int j = Funcs.Data[F].Index; j < i; j++) {
+                    // Decreases the function index or scope offset at the end of an abstraction
+                    while (F2 && j >= Funcs.Data[F2].LastIndex) F2--;
+                    while (j >= Abstractions.Data[StackIndex].OffsetEnd) StackIndex--;
+
+                    // Tracks the most recent function to later sum their input counts
+                    // Increases the scope offset when parseing an abstraction
+                    if (F2 < LastF && Funcs.Data[F2 + 1].Index == j) F2++;
+                    else if (Output.Data[j].Size > 1 && Output.Data[j].InputID) {
+                        if (ResizeArray(&Abstractions, (++StackIndex + 1) * sizeof (Abstraction))) goto CallFuncDefer;
+                        Abstractions.Data[StackIndex].ScopeOffset = Abstractions.Data[StackIndex - 1].ScopeOffset + Output.Data[j].InputID;
+                        Abstractions.Data[StackIndex].OffsetEnd = j + Output.Data[j].Size;
+                    }
+
+                    if (Output.Data[j].Size == 1 && Output.Data[j].InputID >= Abstractions.Data[StackIndex].ScopeOffset) {
+                        // Stops counting potential inputs when detecting a sentinel value or the current variable is bound to an abstraction
+                        int F3 = F2 + 1;
+                        int AppliedOffset = 0;
+                        int ScopedOffset = Abstractions.Data[StackIndex].ScopeOffset;
+                        do {
+                            AppliedOffset += Funcs.Data[--F3].InputCount;
+                            ScopedOffset += Output.Data[Funcs.Data[F3].Index].InputID;
+                        } while (F3 && Funcs.Data[F3].PrevIndex == 0 && (ScopedOffset <= Output.Data[j].InputID || Funcs.Data[F3].InputCount + Output.Data[Funcs.Data[F3].Index].InputID == 0));
+
+                        // Increases previous InputID with the new potential arguments
+                        // if (F2 == LastF) AppliedOffset -= Funcs.Data[LastF].InputCount;
+                        Output.Data[j].InputID += AppliedOffset;
+                    }
+                }
+
+                // Removes inputs because they are now potential arguments of a free variable
+                for (int j = F; j <= LastF; j++) {
+                    Output.Data[Funcs.Data[j].Index].InputID += Funcs.Data[j].InputCount;
+                    Funcs.Data[j].InputCount = 0;
+                }
+
+                PostFreeVariable = 1;
+                // Output.Data[i++].InputID -= Funcs.Data[LastF].InputCount;
+                i++;
+                PROFILE_END();
                 continue;
             }
 
@@ -227,7 +296,7 @@ static int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer) {
                 continue;
             }
 
-            // Arguments applied to previous abstractions are skipped on the next reduction by updating the scoped argument count
+            // Variables free to arguments need to skip argument applied to previous abstractions so the scoped argument count is updated
             PROFILE_NAMED("Bound variable evaluation");
             for (int j = F - 1; j && Funcs.Data[j].PrevIndex == 0 && (Funcs.Data[j].InputCount == 0 || FuncArgs.Data[Funcs.Data[j].ArgumentIndex].Index < ArgumentIndex); j--)
                 ScopedOffset += Funcs.Data[j].InputCount;
@@ -320,32 +389,40 @@ static int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer) {
                 .PrevIndex = 0,
             };
 
-            // Potential arguments cannot reduce bound variables
-            int NextTerm = 0;
-            for (int j = Funcs.Data[Funcs.Size - 1].Index; j < i; j++)
+            // Potential arguments of a free variable cannot reduce when evaluating arguments
+            if (PostFreeVariable) {
+                i++;
+                continue;
+            }
+            
+            // Potential arguments cannot reduce variables bound to other potential arguments
+            PROFILE_NAMED("Abstraction evaluation");
+
+            int MinF = 0;
+            for (int j = i; j; j--)
                 if (Output.Data[j].Size < 2) {
-                    NextTerm = 1;
-                    i++;
+                    MinF = Funcs.Size - i + j + 1;
                     break;
                 }
 
-            if (NextTerm) continue;
-            PROFILE_NAMED("Abstraction evaluation");
-
             int F = Funcs.Size; // Location of the last function that is a sentinel or not a grouping
             while (--F && Funcs.Data[F].PrevIndex == 0 && Funcs.Data[F].InputCount + Output.Data[Funcs.Data[F].Index].InputID == 0);
-                
+            if (MinF > F) F = MinF;
+
             for (int I = i; Output.Data[i].InputID;) {
                 // Cannot update the current function with arguments of previously applied functions
                 if (I + Output.Data[I].Size >= Funcs.Data[F].LastIndex) {
                     int ArgumentCount = 0;
+                    int NextScope = 0;
+                    if (F <= MinF) break;
+
                     do {
                         if (I + Output.Data[I].Size >= Funcs.Data[F].LastIndex) {
                             ArgumentCount += Funcs.Data[F].InputCount;
 
                             // Cannot apply arguments that do not exist or are outside the range of an known or potential argument
                             if (F == 0 || Funcs.Data[F].PrevIndex || Funcs.Data[F].InputCount == 0 && Output.Data[Funcs.Data[F].Index].InputID) {
-                                NextTerm = 1;
+                                NextScope = 1;
                                 break;
                             }
 
@@ -360,7 +437,7 @@ static int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer) {
                     } while (ArgumentCount);
 
                     // There are no more applications for the current function
-                    if (NextTerm) break;
+                    if (NextScope) break;
                     continue;
                 }
 
@@ -518,7 +595,7 @@ int main(void) {
 	CallFunc(Times2, sizeof(Times2) / sizeof(Times2[0]), &Output);
 
     // Pred = (λnfx. n (λgh. h (g f)) (λu. x) (λu. u))
-    // Sub (m - n) = (λmn. m Pred n)
+    // Sub (n - m) = (λmn. m Pred n)
     Func Sub [] = {
         {14, 2}, {1, 0}, {11, 3}, {1, 0}, {5, 2}, {1, 1}, {3, 0}, {1, 0}, {1, 3}, {2, 1}, {1, 3}, {2, 1}, {1, 0}, {1, 1},
 		{5, 2}, {1, 0}, {3, 0}, {1, 0}, {1, 1},
@@ -583,6 +660,29 @@ int main(void) {
 	    {13, 2}, {1, 0}, {11, 0}, {1, 0}, {9, 0}, {1, 0}, {7, 0}, {1, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1}
 	};
 	CallFunc(Fibonacci, sizeof(Fibonacci) / sizeof(Fibonacci[0]), &Output);
+
+    // Div = (λcnmfx. (λd. IsZero d (Zero f x) (f (c d m f x))) (Sub n m))
+    // Divide = (λn. Y div (Succ n))
+    Func Divide [] = {
+        {48, 1}, {11, 1}, {5, 1}, {1, 1}, {3, 0}, {1, 0}, {1, 0}, {5, 1}, {1, 1}, {3, 0}, {1, 0}, {1, 0},
+        {30, 5}, {15, 1}, {1, 0}, {2, 3}, {1, 2}, {2, 2}, {1, 0}, {1, 5},
+        {8, 0}, {1, 4}, {6, 0}, {1, 1}, {1, 0}, {1, 3}, {1, 4}, {1, 5},
+        {14, 0}, {1, 2}, {11, 3}, {1, 0}, {5, 2}, {1, 1}, {3, 0}, {1, 0}, {1, 3}, {2, 1}, {1, 3}, {2, 1}, {1, 0}, {1, 1},
+        {6, 2}, {1, 0}, {4, 0}, {1, 2}, {1, 0}, {1, 1},
+        {17, 0}, {9, 3}, {1, 1}, {7, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1}, {1, 2}, {7, 2}, {1, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1},
+        {7, 2}, {1, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1}
+    };
+	CallFunc(Divide, sizeof(Divide) / sizeof(Divide[0]), &Output);
+
+    // Divide = (λmnfx. m (λrq. q r) (λq. x) (Y (λq. n (λqr. r q) (λr. f (r q)) (λx x))))
+    Func Divide2 [] = {
+        {31, 4}, {1, 0}, {3, 2}, {1, 1}, {1, 0}, {2, 1}, {1, 4}, {24, 0},
+        {11, 1}, {5, 1}, {1, 1}, {3, 0}, {1, 0}, {1, 0}, {5, 1}, {1, 1}, {3, 0}, {1, 0}, {1, 0},
+        {12, 1}, {1, 2}, {3, 2}, {1, 1}, {1, 0}, {5, 1}, {1, 4}, {3, 0}, {1, 0}, {1, 1}, {2, 1}, {1, 0},
+        {17, 0}, {9, 3}, {1, 1}, {7, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1}, {1, 2}, {7, 2}, {1, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1},
+        {7, 2}, {1, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1}
+    };
+	CallFunc(Divide2, sizeof(Divide2) / sizeof(Divide2[0]), &Output);
 
     PROFILE_END();
     return 0;
