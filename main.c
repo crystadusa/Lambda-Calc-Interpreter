@@ -1,6 +1,6 @@
 // Includes and binds the tracy profiler for instrumentation
 #ifdef TRACY_ENABLE
-#include "dep/tracy/public/tracy/TracyC.h"
+#include <tracy/public/tracy/TracyC.h>
 #define PROFILE_SCOPE() TracyCZone(__profile, 1)
 #define PROFILE_NAMED(name) TracyCZoneN(__profile, name, 1)
 #define PROFILE_CONTEXT(name, context) TracyCZoneN(context, name, 1)
@@ -187,7 +187,8 @@ static int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer) {
             }
 
             Funcs.Size -= FuncOffset;
-            FuncArgs.Size = Funcs.Data[--Funcs.Size].ArgumentIndex + Funcs.Data[Funcs.Size].InputCount;
+            Funcs.Size--;
+            FuncArgs.Size = Funcs.Data[Funcs.Size].ArgumentIndex + Funcs.Data[Funcs.Size].InputCount;
             PROFILE_END();
     	}
     	
