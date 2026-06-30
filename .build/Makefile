@@ -1,5 +1,5 @@
 # Directories and lists of files by type
-SRC_DIR := ..
+SRC_DIR := ../src
 BLD_DIR := ../build
 DEP_DIR := ../dep
 
@@ -9,7 +9,7 @@ EXEC := lambda
 
 # Compilation flags
 ASMFLAGS := -masm=intel -fverbose-asm -fno-lto
-CFLAGS := -DNDEBUG -MMD -MP -isystem $(DEP_DIR) -Wall -Wextra -pedantic -Wconversion -Wdouble-promotion -Wno-parentheses -Wno-sign-conversion
+CFLAGS := -MMD -MP -isystem $(DEP_DIR) -Wall -Wextra -pedantic -Wconversion -Wdouble-promotion -Wno-parentheses -Wno-sign-conversion -Wno-unused-function
 LDFLAGS := -w
 
 TRACY_LDFLAGS := -lstdc++

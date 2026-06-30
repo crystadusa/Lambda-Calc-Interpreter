@@ -1,35 +1,6 @@
-// Includes and binds the tracy profiler for instrumentation
-#ifdef TRACY_ENABLE
-#include <tracy/public/tracy/TracyC.h>
-#define PROFILE_SCOPE() TracyCZone(__profile, 1)
-#define PROFILE_NAMED(name) TracyCZoneN(__profile, name, 1)
-#define PROFILE_CONTEXT(name, context) TracyCZoneN(context, name, 1)
-#define PROFILE_END() TracyCZoneEnd(__profile)
-#define PROFILE_END_CONTEXT(context) TracyCZoneEnd(context)
-#else
-#define PROFILE_SCOPE()
-#define PROFILE_NAMED(name)
-#define PROFILE_CONTEXT(name, context)
-#define PROFILE_END()
-#define PROFILE_END_CONTEXT(context)
-#endif
+#include "lambda.h"
 
-// implementation of dynamically sized arrays
-#include <stdlib.h>
-
-typedef struct {
-    void* Data;
-    int Size;
-    int Capacity;
-} Array;
-
-#define Array(Type) typedef struct {\
-    Type* Data;\
-    int Size;\
-    int Capacity;\
-} Type##Array
-
-static int ResizeArray(void* DynArray, int Size) {
+int ResizeArray(void* DynArray, int Size) {
     Array* Data = (Array*) 1;
     Array* Array = DynArray;
     if (Array->Capacity < Size) {
@@ -48,61 +19,28 @@ static int ResizeArray(void* DynArray, int Size) {
     return Data ? 0 : 1;
 }
 
-// Constants to initialize buffers and limit recursion
-#define StartBufferSize 4096
-#define MaxRecursionCount 4096
-
-// Data layout of types for lambda evaluation
-typedef struct {
-	int Size;
-	int InputID; // BoundId when Size is 1 and AbstractionCount otherwise
-} Func;
-
-typedef struct {
-    int Index;
-    int InputCount;
-    int ArgumentIndex;
-	int LastIndex;
-	int PrevIndex;
-} FuncStack;
-
-typedef struct {
-    int IsReduced;
-    int Index;
-} FuncArg;
-
-typedef struct {
-    int ScopeOffset;
-    int OffsetEnd;
-} Abstraction;
-
-Array(Func);
-Array(FuncStack);
-Array(FuncArg);
-Array(Abstraction);
-
-static void UpdateFuncSize(Func* Output, FuncStack* Funcs, int FuncIndex, FuncArg* FuncArgs, int MaxInputIndex, int FirstIndex, int SizeOffset) {
+void UpdateFuncSize(Func* Output, FuncStack* Funcs, int FuncIndex, FuncArg* FuncArgs, int MaxArgIndex, int StartIndex, int SizeOffset) {
     PROFILE_SCOPE();
 
     // Updates sized terms
-	for (int i = 0; i < FirstIndex; i++)
-		if (Output[i].Size > FirstIndex - i)
+	for (int i = 0; i < StartIndex; i++)
+		if (Output[i].Size > StartIndex - i)
 			Output[i].Size += SizeOffset;
 
     // Updates function end positions
     for (int i = FuncIndex + 1; i;)
-        if (Funcs[--i].LastIndex > FirstIndex)
+        if (Funcs[--i].LastIndex > StartIndex)
             Funcs[i].LastIndex += SizeOffset;
 
     // Updates argument positions
-    for (int i = 0; i < MaxInputIndex; i++)
-        if (FuncArgs[i].Index > FirstIndex)
+    for (int i = 0; i < MaxArgIndex; i++)
+        if (FuncArgs[i].Index > StartIndex)
             FuncArgs[i].Index += SizeOffset;
 
     PROFILE_END();
 }
 
-static int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer) {
+int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursionCount) {
     PROFILE_NAMED("Lambda evaluation");
     
     int ReturnValue = 1;
@@ -124,8 +62,8 @@ static int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer) {
     FuncArgArray FuncArgs = {0};
 	FuncStackArray Funcs = {0};
     FuncArray ReductionBuffer = {0};
-    if (ResizeArray(&Abstractions, StartBufferSize) || ResizeArray(&FuncArgs, StartBufferSize) ||
-        ResizeArray(&Funcs, StartBufferSize) || ResizeArray(&ReductionBuffer, StartBufferSize)) goto CallFuncDefer;
+    if (ResizeArray(&Abstractions, START_BUFFER_SIZE) || ResizeArray(&FuncArgs, START_BUFFER_SIZE) ||
+        ResizeArray(&Funcs, START_BUFFER_SIZE) || ResizeArray(&ReductionBuffer, START_BUFFER_SIZE)) goto CallFuncDefer;
     
     // Initializes a sentinel for function lookups
     Funcs.Data[0] = (FuncStack) {
@@ -137,9 +75,9 @@ static int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer) {
     };
 	
 	for (int i = 0; i < Output.Size || Funcs.Size;) {
-        // Removes arguments and groupings after parseing a function
+        // Removes arguments and groupings after parsing a function
     	if (i >= Funcs.Data[Funcs.Size].LastIndex) {
-            PROFILE_NAMED("Removeing arguments");
+            PROFILE_NAMED("Removing arguments");
 
             // Calculates the number of preceding groupings ending before or at the end of the current function
             int F = Funcs.Size;
@@ -180,7 +118,7 @@ static int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer) {
                 Output.Size += i - LastInputIndex;
             }
         
-            // Restores the previous parseing state
+            // Restores the previous parsing state
             if (Funcs.Data[Funcs.Size].PrevIndex) {
                 i = Funcs.Data[Funcs.Size].PrevIndex - 1;
                 PostFreeVariable = 0;
@@ -209,7 +147,7 @@ static int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer) {
             int BoundID = Output.Data[i].InputID - ScopedOffset + Output.Data[Funcs.Data[F].Index].InputID + Funcs.Data[F].InputCount;
             if (F == 0 || Funcs.Data[F].PrevIndex || BoundID >= Funcs.Data[F].InputCount) {
                 // Unapplied bound variables cannot be reduced so the applied variable count decreases their bound ID instead
-                // Free variables do not need separate parseing when not evaluating arguments
+                // Free variables do not need separate parsing when not evaluating arguments
                 if (Funcs.Data[F].PrevIndex == 0) {
                     Output.Data[i++].InputID -= AppliedOffset;
                     continue;
@@ -234,15 +172,15 @@ static int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer) {
                     .OffsetEnd = i
                 };
 
-                int F2 = F;
+                int ScopeF = F;
                 for (int j = Funcs.Data[F].Index; j < i; j++) {
                     // Decreases the function index or scope offset at the end of an abstraction
-                    while (F2 && j >= Funcs.Data[F2].LastIndex) F2--;
+                    while (ScopeF && j >= Funcs.Data[ScopeF].LastIndex) ScopeF--;
                     while (j >= Abstractions.Data[StackIndex].OffsetEnd) StackIndex--;
 
                     // Tracks the most recent function to later sum their input counts
-                    // Increases the scope offset when parseing an abstraction
-                    if (F2 < LastF && Funcs.Data[F2 + 1].Index == j) F2++;
+                    // Increases the scope offset when parsing an abstraction
+                    if (ScopeF < LastF && Funcs.Data[ScopeF + 1].Index == j) ScopeF++;
                     else if (Output.Data[j].Size > 1 && Output.Data[j].InputID) {
                         if (ResizeArray(&Abstractions, (++StackIndex + 1) * sizeof (Abstraction))) goto CallFuncDefer;
                         Abstractions.Data[StackIndex].ScopeOffset = Abstractions.Data[StackIndex - 1].ScopeOffset + Output.Data[j].InputID;
@@ -251,13 +189,13 @@ static int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer) {
 
                     if (Output.Data[j].Size == 1 && Output.Data[j].InputID >= Abstractions.Data[StackIndex].ScopeOffset) {
                         // Stops counting potential inputs when detecting a sentinel value or the current variable is bound to an abstraction
-                        int F3 = F2 + 1;
+                        int F = ScopeF + 1;
                         int AppliedOffset = 0;
                         int ScopedOffset = Abstractions.Data[StackIndex].ScopeOffset;
                         do {
-                            AppliedOffset += Funcs.Data[--F3].InputCount;
-                            ScopedOffset += Output.Data[Funcs.Data[F3].Index].InputID;
-                        } while (F3 && Funcs.Data[F3].PrevIndex == 0 && (ScopedOffset <= Output.Data[j].InputID || Funcs.Data[F3].InputCount + Output.Data[Funcs.Data[F3].Index].InputID == 0));
+                            AppliedOffset += Funcs.Data[--F].InputCount;
+                            ScopedOffset += Output.Data[Funcs.Data[F].Index].InputID;
+                        } while (F && Funcs.Data[F].PrevIndex == 0 && (ScopedOffset <= Output.Data[j].InputID || Funcs.Data[F].InputCount + Output.Data[Funcs.Data[F].Index].InputID == 0));
 
                         // Increases previous InputID with the new potential arguments
                         // if (F2 == LastF) AppliedOffset -= Funcs.Data[LastF].InputCount;
@@ -325,7 +263,7 @@ static int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer) {
                 if (Output.Data[j].Size == 1 && Output.Data[j].InputID >= Abstractions.Data[StackIndex].ScopeOffset)
                     ReductionBuffer.Data[BufferIndex - 1].InputID += ScopedOffset;
                 
-                // Increases the scope offset when parseing an abstraction
+                // Increases the scope offset when parsing an abstraction
                 else if (Output.Data[j].InputID) {
                     if (ResizeArray(&Abstractions, (++StackIndex + 1) * sizeof (Abstraction))) goto CallFuncDefer;
                     Abstractions.Data[StackIndex].ScopeOffset = Abstractions.Data[StackIndex - 1].ScopeOffset + Output.Data[j].InputID;
@@ -455,7 +393,7 @@ static int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer) {
                 };
             }
             
-            // Limits the parseing of functions with applications to terminate infinite recursion
+            // Limits the parsing of functions with applications to terminate infinite recursion
             i++;
             if (Funcs.Data[Funcs.Size].InputCount && ++AbstractionsParsed >= MaxRecursionCount) goto CallFuncDefer;
             PROFILE_END();
@@ -496,7 +434,7 @@ static int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer) {
                         Output.Data[j].InputID -= Output.Data[i + 1].InputID;
                     else Output.Data[j].InputID += Output.Data[i].InputID;
                 
-                // Increases the scope offset when parseing an abstraction
+                // Increases the scope offset when parsing an abstraction
             	else if (Output.Data[j].InputID) {
                     if (ResizeArray(&Abstractions, (++StackIndex + 1) * sizeof (Abstraction))) goto CallFuncDefer;
                 	Abstractions.Data[StackIndex].ScopeOffset = Abstractions.Data[StackIndex - 1].ScopeOffset + Output.Data[j].InputID;
@@ -533,158 +471,216 @@ static int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer) {
     return ReturnValue;
 }
 
-int main(void) {
-    PROFILE_SCOPE();
+// OutChars must be a buffer at least a MAX_INT_CHARS character long
+int IntToChars(char* OutChars, int InNum) {
+    // Determines the number of decimal digits in an integer
+    int Num = InNum;
+    int Digits = 1;
+    while (Num > 9) {
+        Digits++;
+        Num /= 10;
+    }
+
+    // Writes the decimal digits to a string buffer
+    Num = InNum;
+    for (int j = Digits; j > 0;) {
+        OutChars[--j] = '0' + (char) (Num % 10);
+        Num /= 10;
+    }
+
+    // Returns the number of digits written
+    return Digits;
+}
+
+// TODO file and lambda validation
+int main(int argc, char** argv) {
+    // Reads the input and output file paths
+    char* InFilePath = 0;
+    char* OutFilePath = 0;
+
+    int IsBinaryMode = 0;
+    int InFileIsBinary = 0;
+    int OutFileIsBinary = 0;
+
+    int StopArguments = 0;
+    int MaxRecursionCount = 4096;
+
+    static char HelpStr [] = "\n"
+        "lambda <InFilePath> <OutFilePath>\n"
+        "Options:\n"
+        "    -b, -binary         Reads next file as an array of numeric terms in binary.\n"
+        "    -r, -recurse <Max>  Limit on evaluating functions with arguments before terminating.\n"
+        "    -t, -text           Reads next file as text with numeric terms separated by white space.\n"
+        "    --                  Reads remaining arguments as file paths.";
+
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] == '-' && StopArguments == 0) {
+            // Parse the next file as binary or text
+            if (argv[i][1] == 'b' || argv[i][1] == 'B') IsBinaryMode = 1;
+            else if (argv[i][1] == 't' || argv[i][1] == 'T') IsBinaryMode = 0;
+
+            // '--' makes all the following arguments file paths
+            else if (argv[i][1] == '-') StopArguments = 1;
+
+            // Parses the number after '-r' as the max recursion count
+            else if (argv[i][1] == 'r' || argv[i][1] == 'R') {
+                MaxRecursionCount = 0;
+                if (argv[i][2] >= '0' && argv[i][2] <= '9') {
+                    int j = 2;
+                    do {
+                        int Overflow = 0;
+                        if (OVERFLOW_MUL_I32(MaxRecursionCount, 10)) Overflow = 1;
+                        if (OVERFLOW_ADD_I32(MaxRecursionCount, argv[i][j] - '0')) Overflow = 1;
+
+                        j++;
+                        if (Overflow) {
+                            MaxRecursionCount = INT_MAX;
+                            break;
+                        }
+                    } while (argv[i][j] >= '0' && argv[i][j] <= '9');
+                }
+
+                // Parses the next argument as a number when one was not after '-r'
+                else if (++i < argc && argv[i][0] >= '0' && argv[i][0] <= '9') {
+                    int j = 0;
+                    do {
+                        int Overflow = 0;
+                        if (OVERFLOW_MUL_I32(MaxRecursionCount, 10)) Overflow = 1;
+                        if (OVERFLOW_ADD_I32(MaxRecursionCount, argv[i][j] - '0')) Overflow = 1;
+
+                        j++;
+                        if (Overflow) {
+                            MaxRecursionCount = INT_MAX;
+                            break;
+                        }
+                    } while (argv[i][j] >= '0' && argv[i][j] <= '9');
+                }
+
+                // Returns error when no number is found
+                else {
+                    puts("Error: Recursion limit is unspecified");
+                    puts(HelpStr);
+                    return 1;
+                }
+            }
+
+            // Terminates for unrecognized option
+            else {
+                puts("Error: Unrecognized command line argument");
+                puts(HelpStr);
+                return 1;
+            }
+        }
+
+        // Reads the next file path
+        else if (InFilePath == 0) {
+            InFilePath = argv[i];
+            InFileIsBinary = IsBinaryMode;
+            IsBinaryMode = 0;
+        }
+        
+        else if (OutFilePath == 0) {
+            OutFilePath = argv[i];
+            OutFileIsBinary = IsBinaryMode;
+            IsBinaryMode = 0;
+        }
+    }
+
+    // Display error if there are not enough command line argument
+    if (InFilePath == 0 || OutFilePath == 0) {
+        puts("Error: Two files must be entered");
+        puts(HelpStr);
+        return 1;
+    }
+
+    // Opens the input file
+    FILE* InFile = fopen(InFilePath, "rb");
+    if (InFile == 0) {
+        puts("Error: File path is not valid");
+        return 1;
+    }
+
+    // Determines the size of the input file
+    if (fseek(InFile, 0, SEEK_END) == -1) goto MainDefer;
+    int InFileSize = ftell(InFile);
+    if (InFileSize == -1) goto MainDefer;
+    rewind(InFile);
+
+    // Allocates memory to read the input file
+    char* FileMem = malloc(InFileSize);
+    if (FileMem == 0) goto MainDefer;
+    
+    if (fread(FileMem, 1, InFileSize, InFile) != (size_t) InFileSize) goto MainDefer;
+
+    // Converts byte units to term units for binary inputs
+    int* TermMem;
+    int TermCount = 0;
+    if (InFileIsBinary) {
+        TermMem = (int*) FileMem;
+        TermCount = InFileSize / sizeof (int);
+    }
+
+    // Parses text with numbers separated by white space as lambda terms
+    else {
+        TermMem = malloc(InFileSize * sizeof (int));
+        for (int i = 0;;) {
+            while (i < InFileSize && (FileMem[i] < '0' || FileMem[i] > '9')) i++;
+            if (i >= InFileSize) break;
+
+            // Parses each digit of a number and stores the result
+            int Term = 0;
+            do {
+                int Overflow = 0;
+                if (OVERFLOW_MUL_I32(Term, 10)) Overflow = 1;
+                if (OVERFLOW_ADD_I32(Term, FileMem[i] - '0')) Overflow = 1;
+
+                i++;
+                if (Overflow) {
+                    puts("Error: Term is greater than the 32 bit signed integer limit");
+                    return 1;
+                }
+            } while (i < InFileSize && FileMem[i] >= '0' && FileMem[i] <= '9');
+
+            TermMem[TermCount++] = Term;
+        }
+    }
+
+    // Reduces the lambda function to normal form
     FuncArray Output = {0};
-    if (ResizeArray(&Output, StartBufferSize)) return 1;
-    
-    // Tests removing redundant groupings and abstractions
-	Func ReduceGroupings [] = {{10, 0}, {1, 0}, {8, 1}, {7, 0}, {1, 2}, {5, 1}, {1, 3}, {3, 0}, {1, 4}, {1, 5}};
-	CallFunc(ReduceGroupings, sizeof(ReduceGroupings) / sizeof(ReduceGroupings[0]), &Output);
+    if (ResizeArray(&Output, START_BUFFER_SIZE)) goto MainDefer;
 
-	Func ReduceAbstractions [] = {{16, 3}, {15, 2}, {14, 2}, {1, 4}, {1, 3}, {1, 7}, {10, 2}, {1, 1}, {1, 6}, {1, 5}, {1, 9}, {5, 1}, {1, 0}, {1, 7}, {1, 6}, {1, 10}};
-	CallFunc(ReduceAbstractions, sizeof(ReduceAbstractions) / sizeof(ReduceAbstractions[0]), &Output);
+    if (CallFunc((Func*) TermMem, TermCount / 2, &Output, MaxRecursionCount)) {
+        puts("Error: Failed to reduce function to normal form");
+        return 1;
+    }
 
-    // True = (λxy. x), False = (λxy. y)
-	Func False [] = {{2, 2}, {1, 1}, {1, 0}, {3, 0}, {2, 2}, {1, 1}};
-	CallFunc(False, sizeof(False) / sizeof(False[0]), &Output);
+    // Opens the output file
+    FILE* OutFile = fopen(OutFilePath, "wb");
+    if (OutFile == 0) goto MainDefer;
 
-    // Not = (λp. p False True)
-	Func Not [] = {{6, 1}, {1, 0}, {2, 2}, {1, 1}, {2, 2}, {1, 0}, {2, 2}, {1, 0}};
-	CallFunc(Not, sizeof(Not) / sizeof(Not[0]), &Output);
+    // Writes the reduced form to the output file
+    if (OutFileIsBinary) fwrite(Output.Data, sizeof (Func), Output.Size, OutFile);
 
-    // Succ = (λnfx. f (n f x))
-    // Zero = (λfx. x), One = (λfx. f x), Two = (λfx. f (f x))...
-	Func Succ [32] = {{6, 3}, {1, 1}, {4, 0}, {1, 0}, {1, 1}, {1, 2}};
-	for (int i = 0; i < 7; i++) {
-    	int j = 0;
-    	for (; j < Output.Data[0].Size; j++)
-        	Succ[6 + j] = Output.Data[j];
-    	CallFunc(Succ, 6 + j, &Output);
-	}
-    
-    // Plus = (λmn. m Succ n)
-	Func Plus [] = {
-    	{9, 2}, {1, 0}, {6, 3}, {1, 1}, {4, 0}, {1, 0}, {1, 1}, {1, 2}, {1, 1},
-    	{10, 2}, {1, 0}, {8, 0}, {1, 0}, {6, 0}, {1, 0}, {4, 0}, {1, 0}, {2, 0}, {1, 1},
-    	{6, 2}, {1, 0}, {4, 0}, {1, 0}, {2, 0}, {1, 1}
-	};
-	CallFunc(Plus, sizeof(Plus) / sizeof(Plus[0]), &Output);
-    
-    // Plus = (λmnfx. m f (n f x))
-	Func Plus2 [] = {
-    	{7, 4}, {1, 0}, {1, 2}, {4, 0}, {1, 1}, {1, 2}, {1, 3},
-    	{8, 2}, {1, 0}, {6, 0}, {1, 0}, {4, 0}, {1, 0}, {2, 0}, {1, 1},
-    	{8, 2}, {1, 0}, {6, 0}, {1, 0}, {4, 0}, {1, 0}, {2, 0}, {1, 1}
-	};
-	CallFunc(Plus2, sizeof(Plus2) / sizeof(Plus2[0]), &Output);
-    
-    // Mult = (λmn. m (PLUS n) 0)
-	Func Times [] = {
-    	{15, 2}, {1, 0}, {11, 0}, {9, 2}, {1, 0}, {6, 3}, {1, 1}, {4, 0}, {1, 0}, {1, 1}, {1, 2}, {1, 1}, {1, 1}, {2, 2}, {1, 1},
-    	{6, 2}, {1, 0}, {4, 0}, {1, 0}, {2, 0}, {1, 1},
-    	{6, 2}, {1, 0}, {4, 0}, {1, 0}, {2, 0}, {1, 1}
-	};
-	CallFunc(Times, sizeof(Times) / sizeof(Times[0]), &Output);
-    
-    // Mult = (λmnf. m (n f))
-	Func Times2 [] = {
-    	{5, 3}, {1, 0}, {3, 0}, {1, 1}, {1, 2},
-    	{8, 2}, {1, 0}, {6, 0}, {1, 0}, {4, 0}, {1, 0}, {2, 0}, {1, 1},
-    	{8, 2}, {1, 0}, {6, 0}, {1, 0}, {4, 0}, {1, 0}, {2, 0}, {1, 1}
-	};
-	CallFunc(Times2, sizeof(Times2) / sizeof(Times2[0]), &Output);
+    // Converts lambda terms into a string with two numbers surrounded by parenthesis
+    else for (int i = 0; i < Output.Size; i++) {
+        char Write [MAX_INT_CHARS * 2 + 4];
+        Write[0] = '(';
 
-    // Pred = (λnfx. n (λgh. h (g f)) (λu. x) (λu. u))
-    // Sub (n - m) = (λmn. m Pred n)
-    Func Sub [] = {
-        {14, 2}, {1, 0}, {11, 3}, {1, 0}, {5, 2}, {1, 1}, {3, 0}, {1, 0}, {1, 3}, {2, 1}, {1, 3}, {2, 1}, {1, 0}, {1, 1},
-		{5, 2}, {1, 0}, {3, 0}, {1, 0}, {1, 1},
-    	{9, 2}, {1, 0}, {7, 0}, {1, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1}
-    };
-	CallFunc(Sub, sizeof(Sub) / sizeof(Sub[0]), &Output);
+        int Offset = IntToChars(Write + 1, Output.Data[i].Size);
+        Write[Offset + 1] = ' ';
 
-    // IsZero = (λn. n (λx. False) True)
-    // Leq = (λmn. IsZero (Sub m n))
-    // Equal = (λmn. Leq m n (Leq n m) False)
-	Func Equal [] = {
-	    {10, 3}, {1, 0}, {1, 1}, {1, 2}, {4, 0}, {1, 0}, {1, 2}, {1, 1}, {2, 2}, {1, 1},
-	    {18, 2}, {1, 0}, {11, 3}, {1, 0}, {5, 2}, {1, 1}, {3, 0}, {1, 0}, {1, 3}, {2, 1}, {1, 3}, {2, 1}, {1, 0}, 
-	    {1, 1}, {2, 3}, {1, 2}, {2, 2}, {1, 0},
-		{5, 2}, {1, 0}, {3, 0}, {1, 0}, {1, 1},
-		{9, 2}, {1, 0}, {7, 0}, {1, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1},
-	};
-	CallFunc(Equal, sizeof(Equal) / sizeof(Equal[0]), &Output);
-	
-    // Pair = (λxyf. f x y)
-    // {} = Nil = False
-    // {x} = (λf. f x)
-    // {y x} = Pair y {x}
-	
-    // Tail = (λl. l (λhtd. t) False)
-    // Skip = (λix. i Tail x)
-	Func Skip [] = {
-	    {9, 2}, {1, 0}, {6, 1}, {1, 0}, {2, 3}, {1, 1}, {2, 2}, {1, 1}, {1, 1},
-		{5, 2}, {1, 0}, {3, 0}, {1, 0}, {1, 1},
-	    {12, 1}, {1, 0}, {1, 1}, {9, 1}, {1, 0}, {1, 2}, {6, 1}, {1, 0}, {1, 3}, {3, 1}, {1, 0}, {1, 4}
-	};
-	CallFunc(Skip, sizeof(Skip) / sizeof(Skip[0]), &Output);
-	
-	// Factorial = Y F
-	// Y = (λg. (λx. g (x x)) (λx. g (x x)))
-	// F = (λfn. (IsZero n) 1 (Mult n (f (Pred n))))
-    Func Factorial [] = {
-        {11, 1}, {5, 1}, {1, 1}, {3, 0}, {1, 0}, {1, 0}, {5, 1}, {1, 1}, {3, 0}, {1, 0}, {1, 0},
-        {34, 2}, {7, 1}, {1, 0}, {3, 1}, {2, 2}, {1, 1}, {2, 2}, {1, 0}, {1, 1}, {3, 2}, {1, 0}, {1, 1}, 
-        {22, 0}, {5, 3}, {1, 0}, {3, 0}, {1, 1}, {1, 2}, {1, 1}, {15, 0}, {1, 0}, {13, 0}, 
-        {11, 3}, {1, 0}, {5, 2}, {1, 1}, {3, 0}, {1, 0}, {1, 3}, {2, 1}, {1, 3}, {2, 1}, {1, 0}, {1, 1},
-		{9, 2}, {1, 0}, {7, 0}, {1, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1},
-    };
-	CallFunc(Factorial, sizeof(Factorial) / sizeof(Factorial[0]), &Output);
-    
-    // (x, y) = Pair x y
-    // Factorial = (λn. n (λp. p (λabf. f (Mult a b) (Succ b))) (1, 1) True)
-    Func Factorial2 [] = {
-	    {27, 1}, {1, 0}, {15, 1}, {1, 0}, {13, 3}, {1, 2},
-        {5, 1}, {1, 1}, {3, 0}, {1, 2}, {1, 0},
-        {6, 2}, {1, 0}, {4, 0}, {1, 3}, {1, 0}, {1, 1},
-	    {8, 1}, {1, 0}, {3, 2}, {1, 0}, {1, 1}, {3, 2}, {1, 0}, {1, 1}, {2, 2}, {1, 0},
-		{11, 2}, {1, 0}, {9, 0}, {1, 0}, {7, 0}, {1, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1},
-	};
-	CallFunc(Factorial2, sizeof(Factorial2) / sizeof(Factorial2[0]), &Output);
-	
-    // Fibonacci = (λn. n (λp. p (λabf. f (Plus a b) a)) (1, 0) True)
-	Func Fibonacci [] = {
-	    {23, 1}, {1, 0}, {12, 1}, {1, 0}, {10, 3}, {1, 2},
-	    {7, 2}, {1, 2}, {1, 0}, {4, 0}, {1, 3}, {1, 0}, {1, 1}, {1, 0},
-	    {7, 1}, {1, 0}, {3, 2}, {1, 0}, {1, 1}, {2, 2}, {1, 1}, {2, 2}, {1, 0},
-	    {13, 2}, {1, 0}, {11, 0}, {1, 0}, {9, 0}, {1, 0}, {7, 0}, {1, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1}
-	};
-	CallFunc(Fibonacci, sizeof(Fibonacci) / sizeof(Fibonacci[0]), &Output);
+        Offset += IntToChars(Write + Offset + 2, Output.Data[i].InputID);
 
-    // Div = (λcnmfx. (λd. IsZero d (Zero f x) (f (c d m f x))) (Sub n m))
-    // Divide = (λn. Y div (Succ n))
-    Func Divide [] = {
-        {48, 1}, {11, 1}, {5, 1}, {1, 1}, {3, 0}, {1, 0}, {1, 0}, {5, 1}, {1, 1}, {3, 0}, {1, 0}, {1, 0},
-        {30, 5}, {15, 1}, {1, 0}, {2, 3}, {1, 2}, {2, 2}, {1, 0}, {1, 5},
-        {8, 0}, {1, 4}, {6, 0}, {1, 1}, {1, 0}, {1, 3}, {1, 4}, {1, 5},
-        {14, 0}, {1, 2}, {11, 3}, {1, 0}, {5, 2}, {1, 1}, {3, 0}, {1, 0}, {1, 3}, {2, 1}, {1, 3}, {2, 1}, {1, 0}, {1, 1},
-        {6, 2}, {1, 0}, {4, 0}, {1, 2}, {1, 0}, {1, 1},
-        {17, 0}, {9, 3}, {1, 1}, {7, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1}, {1, 2}, {7, 2}, {1, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1},
-        {7, 2}, {1, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1}
-    };
-	CallFunc(Divide, sizeof(Divide) / sizeof(Divide[0]), &Output);
+        Write[Offset + 2] = ')';
+        Write[Offset + 3] = ' ';
+        fwrite(Write, 1, Offset + 4, OutFile);
+    }
 
-    // Divide = (λmnfx. m (λrq. q r) (λq. x) (Y (λq. n (λqr. r q) (λr. f (r q)) (λx x))))
-    Func Divide2 [] = {
-        {31, 4}, {1, 0}, {3, 2}, {1, 1}, {1, 0}, {2, 1}, {1, 4}, {24, 0},
-        {11, 1}, {5, 1}, {1, 1}, {3, 0}, {1, 0}, {1, 0}, {5, 1}, {1, 1}, {3, 0}, {1, 0}, {1, 0},
-        {12, 1}, {1, 2}, {3, 2}, {1, 1}, {1, 0}, {5, 1}, {1, 4}, {3, 0}, {1, 0}, {1, 1}, {2, 1}, {1, 0},
-        {17, 0}, {9, 3}, {1, 1}, {7, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1}, {1, 2}, {7, 2}, {1, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1},
-        {7, 2}, {1, 0}, {5, 0}, {1, 0}, {3, 0}, {1, 0}, {1, 1}
-    };
-	CallFunc(Divide2, sizeof(Divide2) / sizeof(Divide2[0]), &Output);
-
-    PROFILE_END();
+    // Acknowledges successful beta reduction and file write
+    puts("Wrote the reduced form to the output file");
     return 0;
+
+    MainDefer:
+    puts("Error: Failed unexpectedly");
+    return 1;
 }

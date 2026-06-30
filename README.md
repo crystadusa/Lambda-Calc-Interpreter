@@ -5,9 +5,17 @@ This project uses a custom format for [lambda expressions](https://en.wikipedia.
 ### Data Format
 Each term has a size followed by an input id. Terms with a size of one are variables where the input id determines if it is free or which abstraction it is bound to. The first abstraction of the innermost function had an id of zero, which is followed by its subsequent abstractions, and then the next most inner function. Sized terms with an input id of zero are groupings which prioritize the order of reductions. When not a potential argument of a free variable nor evaluating an argument, reductions are evaluated inside them. Functions have an abstraction count equal to the input id and apply arguments to internal variables bound to their abstractions; beta reductions.
 
+### Command line syntax
+lambda <InFilePath> <OutFilePath>
+Options:
+* -b, -binary           Reads next file as an array of numeric terms in binary.
+* -r, -recurse \<Max\>  Limit on evaluating functions with arguments before terminating.
+* -t, -text             Reads next file as text with numeric terms separated by white space.
+* --                    Reads remaining arguments as file paths.
+
 ### Configuration
-* StartBufferSize: Initial size of memory buffers in bytes
-* MaxRecursionCount: Limit on evaluating functions with applications before terminating
+* START_BUFFER_SIZE: Initial size of memory buffers in bytes
+* TEST_RECURSION_COUNT: Limit on evaluating functions with applications before terminating for testing
 
 ### Build
 This project has both a make and cmake build system.

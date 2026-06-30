@@ -6,10 +6,10 @@ project(LambdaInterpreter C CXX)
 option(TRACY "Enable Tracy profiler" OFF)
 
 # Directories and executable
-set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/..")
+set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../src")
 set(DEP_DIR "${SRC_DIR}/dep")
 
-add_executable(lambda ${SRC_DIR}/main.c)
+add_executable(lambda ${SRC_DIR}/lambda.c)
 
 # Sets include directories
 target_include_directories(lambda PRIVATE "${DEP_DIR}")
@@ -17,9 +17,8 @@ target_include_directories(lambda PRIVATE "${DEP_DIR}")
 # Compilation and linking flags with link time optimization
 if(CMAKE_C_COMPILER_ID MATCHES "^(GNU|Clang)$")
     target_compile_options(lambda PRIVATE
-        -Wall -Wextra -pedantic
-        -Wconversion -Wdouble-promotion
-        -Wno-parentheses -Wno-sign-conversion
+        -Wall -Wextra -pedantic -Wconversion -Wdouble-promotion
+        -Wno-parentheses -Wno-sign-conversion -Wno-unused-function
         "$<$<CONFIG:Release>:-O2>"
     )
 
