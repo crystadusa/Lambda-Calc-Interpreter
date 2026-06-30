@@ -602,7 +602,7 @@ int main(int argc, char** argv) {
 
     // Determines the size of the input file
     if (fseek(InFile, 0, SEEK_END) == -1) goto MainDefer;
-    int InFileSize = ftell(InFile);
+    int InFileSize = (int) ftell(InFile);
     if (InFileSize == -1) goto MainDefer;
     rewind(InFile);
 
