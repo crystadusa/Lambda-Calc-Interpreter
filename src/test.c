@@ -153,5 +153,6 @@ void test() {
 	CallFunc(Divide2, sizeof(Divide2) / sizeof(Divide2[0]), &Output, TEST_RECURSION_COUNT);
 
 	free(Output.Data);
+	PROFILE_FREE(Output.Data);
     PROFILE_END();
 }

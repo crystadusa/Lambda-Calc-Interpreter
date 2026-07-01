@@ -23,12 +23,16 @@
 #define PROFILE_CONTEXT(name, context) TracyCZoneN(context, name, 1)
 #define PROFILE_END() TracyCZoneEnd(__profile)
 #define PROFILE_END_CONTEXT(context) TracyCZoneEnd(context)
+#define PROFILE_ALLOC(mem, bytes) TracyCAlloc(mem, bytes)
+#define PROFILE_FREE(mem) TracyCFree(mem)
 #else
 #define PROFILE_SCOPE()
 #define PROFILE_NAMED(name)
 #define PROFILE_CONTEXT(name, context)
 #define PROFILE_END()
 #define PROFILE_END_CONTEXT(context)
+#define PROFILE_ALLOC(mem, bytes)
+#define PROFILE_FREE(mem)
 #endif
 
 // implementation of dynamically sized arrays

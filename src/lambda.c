@@ -10,8 +10,13 @@ int ResizeArray(void* DynArray, int Size) {
         if (Array->Capacity < Size) Array->Capacity = Size;
 
         // Reallocates memory into a larger buffer
+        PROFILE_FREE(Array->Data);
         Data = realloc(Array->Data, Array->Capacity);
-        if (Data) Array->Data = Data;
+
+        if (Data) {
+            Array->Data = Data;
+            PROFILE_ALLOC(Data, Array->Capacity);
+        } 
         PROFILE_END();
     }
 
@@ -464,6 +469,10 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
     free(Abstractions.Data);
     free(FuncArgs.Data);
     free(Funcs.Data);
+    PROFILE_FREE(ReductionBuffer.Data);
+    PROFILE_FREE(Abstractions.Data);
+    PROFILE_FREE(FuncArgs.Data);
+    PROFILE_FREE(Funcs.Data);
 
     // Returns the error code and output buffer
     *OutBuffer = Output;
@@ -608,6 +617,7 @@ int main(int argc, char** argv) {
 
     // Allocates memory to read the input file
     char* FileMem = malloc(InFileSize);
+    PROFILE_ALLOC(FileMem, InFileSize);
     if (FileMem == 0) goto MainDefer;
     
     if (fread(FileMem, 1, InFileSize, InFile) != (size_t) InFileSize) goto MainDefer;
@@ -623,6 +633,8 @@ int main(int argc, char** argv) {
     // Parses text with numbers separated by white space as lambda terms
     else {
         TermMem = malloc(InFileSize * sizeof (int));
+        PROFILE_ALLOC(TermMem, InFileSize * sizeof (int));
+        
         for (int i = 0;;) {
             while (i < InFileSize && (FileMem[i] < '0' || FileMem[i] > '9')) i++;
             if (i >= InFileSize) break;
