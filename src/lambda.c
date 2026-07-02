@@ -58,17 +58,14 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
     Output.Size = CalledCount;
 
     // Copies the input buffer to the output buffer
-	for (int i = 0; i < CalledCount; i++)
-    	Output.Data[i] = Called[i];
+    memcpy(Output.Data, Called, CalledCount * sizeof (Func));
 
     // Allocates memory buffers and returns on failure
     // Aside from FuncArgs, the size field is treated as the last index
     AbstractionArray Abstractions = {0};
     FuncArgArray FuncArgs = {0};
 	FuncStackArray Funcs = {0};
-    FuncArray ReductionBuffer = {0};
-    if (ResizeArray(&Abstractions, START_BUFFER_SIZE) || ResizeArray(&FuncArgs, START_BUFFER_SIZE) ||
-        ResizeArray(&Funcs, START_BUFFER_SIZE) || ResizeArray(&ReductionBuffer, START_BUFFER_SIZE)) goto CallFuncDefer;
+    if (ResizeArray(&Abstractions, START_BUFFER_SIZE) || ResizeArray(&FuncArgs, START_BUFFER_SIZE) || ResizeArray(&Funcs, START_BUFFER_SIZE)) goto CallFuncDefer;
     
     // Initializes a sentinel for function lookups
     Funcs.Data[0] = (FuncStack) {
@@ -113,12 +110,10 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
 
             // Removes groupings and arguments from the output buffer
             if (GroupingCount || i != LastInputIndex) {
-                for (int j = Funcs.Data[F].Index; j < i - GroupingCount; j++)
-                    Output.Data[j] = Output.Data[j + GroupingCount];
+                memmove(Output.Data + Funcs.Data[F].Index, Output.Data + Funcs.Data[F].Index + GroupingCount, (i - GroupingCount - Funcs.Data[F].Index) * sizeof (Func));
 
                 i -= GroupingCount;
-                for (int j = 0; j < Output.Size - LastInputIndex; j++)
-                    Output.Data[i + j] = Output.Data[LastInputIndex + j];
+                memmove(Output.Data + i, Output.Data + LastInputIndex, (Output.Size - LastInputIndex) * sizeof (Func));
 
                 Output.Size += i - LastInputIndex;
             }
@@ -245,18 +240,23 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
             for (int j = F - 1; j && Funcs.Data[j].PrevIndex == 0 && (Funcs.Data[j].InputCount == 0 || FuncArgs.Data[Funcs.Data[j].ArgumentIndex].Index < ArgumentIndex); j--)
                 ScopedOffset += Funcs.Data[j].InputCount;
 
+            // Resizes the output buffer to fit the reduced argument
+            int SizeOffset = Output.Data[ArgumentIndex].Size - 1;
+            if (ResizeArray(&Output, (Output.Size + SizeOffset) * sizeof (Func))) goto CallFuncDefer;
+            ArgumentIndex += SizeOffset;
+
+            // Shifts all terms after the reduction position to fit the reduced argument
+            PROFILE_CONTEXT("memmove", __memmove);
+            if (SizeOffset) memmove(Output.Data + i + SizeOffset, Output.Data + i, (Output.Size - i) * sizeof (Func));
+            PROFILE_END_CONTEXT(__memmove);
+
             // Applies a beta reduction
-            int BufferIndex = 0;
+            int ReductionIndex = i;
             int StackIndex = 0;
             Abstractions.Data[0] = (Abstraction) {
                 .ScopeOffset = 0,
                 .OffsetEnd = ArgumentIndex + Output.Data[ArgumentIndex].Size
             };
-
-            // Resizes the output and reduction buffers to fit the reduced argument
-            int SizeOffset = Output.Data[ArgumentIndex].Size - 1;
-            if (ResizeArray(&Output, (Output.Size + SizeOffset) * sizeof (Func))) goto CallFuncDefer;
-            if (ResizeArray(&ReductionBuffer, (SizeOffset + Output.Size - i) * sizeof (Func))) goto CallFuncDefer;
 
             for (int j = ArgumentIndex; j < ArgumentIndex + Output.Data[ArgumentIndex].Size; j++) {
                 // Decreases the scope offset at the end of an abstraction
@@ -264,9 +264,9 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
                     StackIndex--;
 
                 // Use the scoped argument count to increase bound IDs for variables that are free or bounded outside the current abstraction
-                ReductionBuffer.Data[BufferIndex++] = Output.Data[j];
+                Output.Data[ReductionIndex++] = Output.Data[j];
                 if (Output.Data[j].Size == 1 && Output.Data[j].InputID >= Abstractions.Data[StackIndex].ScopeOffset)
-                    ReductionBuffer.Data[BufferIndex - 1].InputID += ScopedOffset;
+                    Output.Data[ReductionIndex - 1].InputID += ScopedOffset;
                 
                 // Increases the scope offset when parsing an abstraction
                 else if (Output.Data[j].InputID) {
@@ -276,34 +276,19 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
                 }
             }
 
-            // Moves a term to the reduction position for when the argument is only one term long
-            Output.Data[i] = ReductionBuffer.Data[0];
-
-            if (SizeOffset) {
-                // Appends the output buffer at the reduction position to the reduction buffer
-                for (int j = 0; j < Output.Size - i - 1; j++)
-                    ReductionBuffer.Data[BufferIndex + j] = Output.Data[i + 1 + j];
-
-                Output.Size += SizeOffset;
-
-                // Moves the reduction buffer to the output buffer at the reduction position
-                for (int j = i + 1; j < Output.Size; j++)
-                    Output.Data[j] = ReductionBuffer.Data[j - i];
-            
-                UpdateFuncSize(Output.Data, Funcs.Data, Funcs.Size, FuncArgs.Data, FuncArgs.Size, i, SizeOffset);
-            }
+            // Updates size and positions from applying a beta reduction
+            Output.Size += SizeOffset;            
+            if (SizeOffset) UpdateFuncSize(Output.Data, Funcs.Data, Funcs.Size, FuncArgs.Data, FuncArgs.Size, i, SizeOffset);
             PROFILE_END();
     	}
 
         // Parses groupings
         else if (Output.Data[i].InputID == 0) {
             if (i < Funcs.Data[Funcs.Size].LastIndex - 1 && Output.Data[i].Size - 1 == Output.Data[i + 1].Size) {
-                PROFILE_NAMED("Grouping evaluation");
-
                 // Removes groupings when they end where the following sized term ends
+                PROFILE_NAMED("Grouping evaluation");
                 Output.Size--;
-                for (int j = i; j < Output.Size; j++)
-                    Output.Data[j] = Output.Data[j + 1];
+                memmove(Output.Data + i, Output.Data + i + 1, (Output.Size - i) * sizeof (Func));
 
                 UpdateFuncSize(Output.Data, Funcs.Data, Funcs.Size, FuncArgs.Data, FuncArgs.Size, i, -1);
                 PROFILE_END();
@@ -409,8 +394,7 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
 	for (int i = 0; i < Output.Size;)
        	if ((i == 0 || Output.Data[i - 1].Size != 1) && Output.Data[i].Size != 1 && Output.Data[i].InputID == 0) {
         	Output.Size--;
-        	for (int j = i; j < Output.Size; j++)
-            	Output.Data[j] = Output.Data[j + 1];
+            memmove(Output.Data + i, Output.Data + i + 1, (Output.Size - i) * sizeof (Func));
           	 
            	for (int j = 0; j < i; j++)
             	if (Output.Data[j].Size > i - j)
@@ -453,8 +437,7 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
    	 
             // Removes the remaining abstraction term
         	Output.Size--;
-        	for (int j = i + 1; j < Output.Size; j++)
-            	Output.Data[j] = Output.Data[j + 1];
+            memmove(Output.Data + i + 1, Output.Data + i + 2, (Output.Size - i - 1) * sizeof (Func));
           	 
            	for (int j = 0; j < i; j++)
             	if (Output.Data[j].Size > i - j)
@@ -465,11 +448,9 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
 
     // Frees memory buffers
     CallFuncDefer: 
-    free(ReductionBuffer.Data);
     free(Abstractions.Data);
     free(FuncArgs.Data);
     free(Funcs.Data);
-    PROFILE_FREE(ReductionBuffer.Data);
     PROFILE_FREE(Abstractions.Data);
     PROFILE_FREE(FuncArgs.Data);
     PROFILE_FREE(Funcs.Data);
@@ -634,7 +615,7 @@ int main(int argc, char** argv) {
     else {
         TermMem = malloc(InFileSize * sizeof (int));
         PROFILE_ALLOC(TermMem, InFileSize * sizeof (int));
-        
+
         for (int i = 0;;) {
             while (i < InFileSize && (FileMem[i] < '0' || FileMem[i] > '9')) i++;
             if (i >= InFileSize) break;

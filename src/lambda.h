@@ -3,6 +3,7 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 // Binds overflow detection for each compiler
 #ifdef __GNUC__
@@ -88,3 +89,4 @@ int ResizeArray(void*, int);
 void UpdateFuncSize(Func*, FuncStack*, int, FuncArg*, int, int, int);
 int CallFunc(Func*, int, FuncArray*, int);
 int IntToChars(char*, int);
+void test(void);

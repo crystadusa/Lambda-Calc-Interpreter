@@ -1,6 +1,6 @@
 #include "lambda.h"
 
-void test() {
+void test(void) {
     PROFILE_SCOPE();
     FuncArray Output = {0};
     if (ResizeArray(&Output, START_BUFFER_SIZE)) return;
