@@ -65,7 +65,6 @@ typedef struct {
     int Index;
     int InputCount;
     int ArgumentIndex;
-	int LastIndex;
 	int PrevIndex;
 } FuncStack;
 
@@ -86,7 +85,7 @@ Array(Abstraction);
 
 // Function prototypes
 int ResizeArray(void*, int);
-void UpdateFuncSize(Func*, FuncStack*, int, FuncArg*, int, int, int);
+void UpdateFuncSize(Func*, FuncArg*, int, int, int);
 int CallFunc(Func*, int, FuncArray*, int);
 int IntToChars(char*, int);
 void test(void);
