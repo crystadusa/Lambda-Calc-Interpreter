@@ -63,34 +63,18 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
     if (ResizeArray(&Abstractions, START_BUFFER_SIZE) || ResizeArray(&FuncArgs, START_BUFFER_SIZE) || ResizeArray(&Funcs, START_BUFFER_SIZE)) goto CallFuncDefer;
     
     // Initializes a sentinel for function lookups
-    Funcs.Data[0] = (FuncStack) {
-        .Index = 0,
-        .InputCount = 0,
-        .ArgumentIndex = 0,
-        .PrevIndex = 0,
-    };
+    Funcs.Data[0] = (FuncStack) {0};
 	
 	for (int i = 0; i < Output.Size || Funcs.Size;) {
         // Removes arguments and groupings after parsing a function
     	if (Funcs.Size && i >= Funcs.Data[Funcs.Size].Index + Output.Data[Funcs.Data[Funcs.Size].Index].Size) {
             PROFILE_NAMED("Removing arguments");
 
-            // Calculates the number of preceding groupings ending before or at the end of the current function
-            int F = Funcs.Size;
-            int GroupingCount = F;
-            for (int Index = Funcs.Data[Funcs.Size].Index; --Index && Output.Data[Index].Size > 1 && Output.Data[Index].InputID + Funcs.Data[F - 1].InputCount == 0 && i >= Index + Output.Data[Index].Size; F--);
-            GroupingCount -= F;
-
-            // Calculates if the current function is now a grouping ending where the following sized term ends
-            int FuncOffset = GroupingCount;
-            int Index = Funcs.Data[Funcs.Size].Index;
-            GroupingCount += Output.Data[Index].Size > 1 && Output.Data[Index].InputID == 0 && Output.Data[Index].Size == 1 + Output.Data[Index + 1].Size;
-
             int LastInputIndex = i;
             if (Funcs.Data[Funcs.Size].InputCount) {
                 // Removes applied variables from earlier abstraction terms
                 LastInputIndex = FuncArgs.Data[FuncArgs.Size - 1].Index;
-                for (int j = Funcs.Size - 1; j && Funcs.Data[j].PrevIndex == 0 && (Funcs.Data[j].InputCount == 0 || FuncArgs.Data[Funcs.Data[j].ArgumentIndex].Index < LastInputIndex); j--)
+                for (int j = Funcs.Size - 1; j && Funcs.Data[j].PrevIndex == 0 && FuncArgs.Data[Funcs.Data[j].ArgumentIndex].Index < LastInputIndex; j--)
                     Funcs.Data[j].InputCount = 0;
 
                 // Updates size and positions from removing arguments
@@ -99,14 +83,32 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
                     UpdateFuncSize(Output.Data, FuncArgs.Data, Funcs.Data[Funcs.Size].ArgumentIndex, i, -Output.Data[j].Size);
             }
 
+            // Calculates the number of preceding groupings ending before or at the end of the current function
+            int GroupingCount = 0;            
+            int FuncOffset = 0;
+            int UpdateIndex = Funcs.Data[Funcs.Size].Index + 1;
+            for (int F = Funcs.Size; --UpdateIndex; GroupingCount++) {
+                if (Output.Data[UpdateIndex - 1].Size < 2 || Output.Data[UpdateIndex - 1].InputID) break;
+                if (UpdateIndex - 1 == Funcs.Data[F - 1].Index && Funcs.Data[F - 1].InputCount) break;
+                if (i < UpdateIndex - 1 + Output.Data[UpdateIndex - 1].Size) break;
+
+                if (UpdateIndex - 1 == Funcs.Data[F - 1].Index && Funcs.Data[F - 1].PrevIndex == 0) {
+                    F--;
+                    FuncOffset++;
+                }
+            }
+
+            // Calculates if the current function is now a grouping ending where the following sized term ends
+            int Index = Funcs.Data[Funcs.Size].Index;
+            GroupingCount += Output.Data[Index].Size > 1 && Output.Data[Index].InputID == 0 && Output.Data[Index].Size == 1 + Output.Data[Index + 1].Size;
+
             // Updates size and positions from removing groupings
-            if (GroupingCount) UpdateFuncSize(Output.Data, FuncArgs.Data, FuncArgs.Size, Funcs.Data[F].Index, -GroupingCount);
+            if (GroupingCount) UpdateFuncSize(Output.Data, FuncArgs.Data, FuncArgs.Size, UpdateIndex, -GroupingCount);
 
             // Removes groupings and arguments from the output buffer
             if (GroupingCount || i != LastInputIndex) {
-                memmove(Output.Data + Funcs.Data[F].Index, Output.Data + Funcs.Data[F].Index + GroupingCount, (i - GroupingCount - Funcs.Data[F].Index) * sizeof (Func));
-
                 i -= GroupingCount;
+                memmove(Output.Data + UpdateIndex, Output.Data + UpdateIndex + GroupingCount, (i - UpdateIndex) * sizeof (Func));
                 memmove(Output.Data + i, Output.Data + LastInputIndex, (Output.Size - LastInputIndex) * sizeof (Func));
 
                 Output.Size += i - LastInputIndex;
@@ -134,7 +136,7 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
             do {
                 AppliedOffset += Funcs.Data[--F].InputCount;
                 ScopedOffset += Output.Data[Funcs.Data[F].Index].InputID;
-             } while (F && Funcs.Data[F].PrevIndex == 0 && (AppliedOffset + ScopedOffset <= Output.Data[i].InputID || Funcs.Data[F].InputCount + Output.Data[Funcs.Data[F].Index].InputID == 0));
+             } while (F && Funcs.Data[F].PrevIndex == 0 && AppliedOffset + ScopedOffset <= Output.Data[i].InputID);
             ScopedOffset += AppliedOffset;
 
             // Detects sentinel values for unapplied bound variables and free variables
@@ -156,7 +158,6 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
                 // Finds the last function that is not a grouping
                 PROFILE_NAMED("Free variable evaluation");
                 int LastF = Funcs.Size;
-                while (LastF && Funcs.Data[LastF].PrevIndex == 0 && Funcs.Data[LastF].InputCount + Output.Data[Funcs.Data[LastF].Index].InputID == 0) LastF--;
 
                 // Free variables may later become bound when evaluating arguments
                 // So Input IDs must be updated to remove potential arguments from functions
@@ -189,7 +190,7 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
                         do {
                             AppliedOffset += Funcs.Data[--F].InputCount;
                             ScopedOffset += Output.Data[Funcs.Data[F].Index].InputID;
-                        } while (F && Funcs.Data[F].PrevIndex == 0 && (ScopedOffset <= Output.Data[j].InputID || Funcs.Data[F].InputCount + Output.Data[Funcs.Data[F].Index].InputID == 0));
+                        } while (F && Funcs.Data[F].PrevIndex == 0 && ScopedOffset <= Output.Data[j].InputID);
 
                         // Increases previous InputID with the new potential arguments
                         // if (F2 == LastF) AppliedOffset -= Funcs.Data[LastF].InputCount;
@@ -228,9 +229,9 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
                 continue;
             }
 
-            // Variables free to arguments need to skip argument applied to previous abstractions so the scoped argument count is updated
+            // Variables free to arguments need to skip arguments applied to previous abstractions so the scoped argument count is updated
             PROFILE_NAMED("Bound variable evaluation");
-            for (int j = F - 1; j && Funcs.Data[j].PrevIndex == 0 && (Funcs.Data[j].InputCount == 0 || FuncArgs.Data[Funcs.Data[j].ArgumentIndex].Index < ArgumentIndex); j--)
+            for (int j = F - 1; j && Funcs.Data[j].PrevIndex == 0 && FuncArgs.Data[Funcs.Data[j].ArgumentIndex].Index < ArgumentIndex; j--)
                 ScopedOffset += Funcs.Data[j].InputCount;
 
             // Resizes the output buffer to fit the reduced argument
@@ -285,17 +286,7 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
 
                 UpdateFuncSize(Output.Data, FuncArgs.Data, FuncArgs.Size, i, -1);
                 PROFILE_END();
-            } else {
-                // Handles groupings as a function
-                if (ResizeArray(&Funcs, (++Funcs.Size + 1) * sizeof (FuncStack))) goto CallFuncDefer;
-                Funcs.Data[Funcs.Size] = (FuncStack) {
-                    .Index = i,
-                    .InputCount = 0,
-                    .ArgumentIndex = FuncArgs.Size,
-                    .PrevIndex = 0,
-                };
-                i++;
-            }
+            } else i++;
         }
         
         // Applies bound variables in abstractions
@@ -316,38 +307,46 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
             }
             
             // Potential arguments cannot reduce variables bound to other potential arguments
+            // The index of the sized term bounding the argument search is capped at the previous variable
             PROFILE_NAMED("Abstraction evaluation");
 
-            int MinF = 0;
+            int MaxIndex = INT_MAX;
             for (int j = i; j; j--)
                 if (Output.Data[j].Size < 2) {
-                    MinF = Funcs.Size - i + j + 1;
+                    MaxIndex = j + 1;
+                    MaxIndex += Output.Data[MaxIndex].Size;
                     break;
                 }
 
-            int F = Funcs.Size; // Location of the last function that is a sentinel or not a grouping
-            while (--F && Funcs.Data[F].PrevIndex == 0 && Funcs.Data[F].InputCount + Output.Data[Funcs.Data[F].Index].InputID == 0);
-            if (MinF > F) F = MinF;
+            int F = Funcs.Size - 1;
+            int SearchIndex = Funcs.Data[F].Index;
+            SearchIndex += Output.Data[SearchIndex].Size;
+
+            if (MaxIndex < SearchIndex) {
+                F++;
+                SearchIndex = MaxIndex;
+            }
 
             for (int I = i; Output.Data[i].InputID;) {
                 // Cannot update the current function with arguments of previously applied functions
-                if (F == 0 ? I + Output.Data[I].Size >= Output.Size : I + Output.Data[I].Size >= Funcs.Data[F].Index + Output.Data[Funcs.Data[F].Index].Size) {
+                if (F == 0 ? I + Output.Data[I].Size >= Output.Size : I + Output.Data[I].Size >= SearchIndex) {
                     int ArgumentCount = 0;
                     int NextScope = 0;
-                    if (F <= MinF) break;
+                    if (SearchIndex >= MaxIndex) break;
 
                     do {
-                        if (F == 0 ? I + Output.Data[I].Size >= Output.Size : I + Output.Data[I].Size >= Funcs.Data[F].Index + Output.Data[Funcs.Data[F].Index].Size) {
+                        if (F == 0 ? I + Output.Data[I].Size >= Output.Size : I + Output.Data[I].Size >= SearchIndex) {
                             ArgumentCount += Funcs.Data[F].InputCount;
 
                             // Cannot apply arguments that do not exist or are outside the range of an known or potential argument
-                            if (F == 0 || Funcs.Data[F].PrevIndex || Funcs.Data[F].InputCount == 0 && Output.Data[Funcs.Data[F].Index].InputID) {
+                            if (F == 0 || Funcs.Data[F].PrevIndex || Funcs.Data[F].InputCount == 0) {
                                 NextScope = 1;
                                 break;
                             }
 
-                            // Finds location of the previous function that is a sentinel or not a grouping
-                            while (--F && Funcs.Data[F].PrevIndex == 0 && Funcs.Data[F].InputCount + Output.Data[Funcs.Data[F].Index].InputID == 0);
+                            // Updates the search index with the previous function
+                            SearchIndex = Funcs.Data[--F].Index;
+                            SearchIndex += Output.Data[SearchIndex].Size;
                             continue;
                         }
 
@@ -474,7 +473,7 @@ int IntToChars(char* OutChars, int InNum) {
 }
 
 // TODO file and lambda validation
-int main(int argc, char** argv) {    
+int main(int argc, char** argv) {
     // Reads the input and output file paths
     char* InFilePath = 0;
     char* OutFilePath = 0;
