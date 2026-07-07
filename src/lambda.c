@@ -24,18 +24,12 @@ int ResizeArray(void* DynArray, int Size) {
     return Data ? 0 : 1;
 }
 
-void UpdateFuncSize(Func* Output, FuncArg* FuncArgs, int MaxArgIndex, int StartIndex, int SizeOffset) {
-    PROFILE_SCOPE();
-
+void UpdateFuncSize(Func* Output, int StartIndex, int SizeOffset) {
     // Updates sized terms
+    PROFILE_SCOPE();
 	for (int i = 0; i < StartIndex; i++)
 		if (Output[i].Size > StartIndex - i)
 			Output[i].Size += SizeOffset;
-
-    // Updates argument positions
-    for (int i = 0; i < MaxArgIndex; i++)
-        if (FuncArgs[i].Index > StartIndex)
-            FuncArgs[i].Index += SizeOffset;
 
     PROFILE_END();
 }
@@ -63,7 +57,7 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
     if (ResizeArray(&Abstractions, START_BUFFER_SIZE) || ResizeArray(&FuncArgs, START_BUFFER_SIZE) || ResizeArray(&Funcs, START_BUFFER_SIZE)) goto CallFuncDefer;
     
     // Initializes a sentinel for function lookups
-    Funcs.Data[0] = (FuncStack) {0};
+    Funcs.Data[0] = (FuncStack) {.PrevIndex = 1};
 	
 	for (int i = 0; i < Output.Size || Funcs.Size;) {
         // Removes arguments and groupings after parsing a function
@@ -73,21 +67,30 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
             int LastInputIndex = i;
             if (Funcs.Data[Funcs.Size].InputCount) {
                 // Removes applied variables from earlier abstraction terms
-                LastInputIndex = FuncArgs.Data[FuncArgs.Size - 1].Index;
-                for (int j = Funcs.Size - 1; j && Funcs.Data[j].PrevIndex == 0 && FuncArgs.Data[Funcs.Data[j].ArgumentIndex].Index < LastInputIndex; j--)
+                LastInputIndex = Funcs.Data[Funcs.Size].Index;
+                for (int j = 0; j < FuncArgs.Data[FuncArgs.Size - 1].Offset; j++)
+                    LastInputIndex += Output.Data[LastInputIndex].Size;
+
+                for (int j = Funcs.Size - 1; Funcs.Data[j].PrevIndex == 0; j--) {
+                    int Index = Funcs.Data[j].Index;
+                    for (int k = 0; k < FuncArgs.Data[Funcs.Data[k].ArgumentIndex].Offset; k++)
+                        Index += Output.Data[Index].Size;
+
+                    if (Index >= LastInputIndex) break;
                     Funcs.Data[j].InputCount = 0;
+                } 
 
                 // Updates size and positions from removing arguments
                 LastInputIndex += Output.Data[LastInputIndex].Size;
                 for (int j = i; j < LastInputIndex; j += Output.Data[j].Size)
-                    UpdateFuncSize(Output.Data, FuncArgs.Data, Funcs.Data[Funcs.Size].ArgumentIndex, i, -Output.Data[j].Size);
+                    UpdateFuncSize(Output.Data, i, -Output.Data[j].Size);
             }
 
             // Calculates the number of preceding groupings ending before or at the end of the current function
             int GroupingCount = 0;            
             int FuncOffset = 0;
-            int UpdateIndex = Funcs.Data[Funcs.Size].Index + 1;
-            for (int F = Funcs.Size; --UpdateIndex; GroupingCount++) {
+            int UpdateIndex = Funcs.Data[Funcs.Size].Index;
+            for (int F = Funcs.Size;; GroupingCount++, UpdateIndex--) {
                 if (Output.Data[UpdateIndex - 1].Size < 2 || Output.Data[UpdateIndex - 1].InputID) break;
                 if (UpdateIndex - 1 == Funcs.Data[F - 1].Index && Funcs.Data[F - 1].InputCount) break;
                 if (i < UpdateIndex - 1 + Output.Data[UpdateIndex - 1].Size) break;
@@ -103,7 +106,7 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
             GroupingCount += Output.Data[Index].Size > 1 && Output.Data[Index].InputID == 0 && Output.Data[Index].Size == 1 + Output.Data[Index + 1].Size;
 
             // Updates size and positions from removing groupings
-            if (GroupingCount) UpdateFuncSize(Output.Data, FuncArgs.Data, FuncArgs.Size, UpdateIndex, -GroupingCount);
+            if (GroupingCount) UpdateFuncSize(Output.Data, UpdateIndex, -GroupingCount);
 
             // Removes groupings and arguments from the output buffer
             if (GroupingCount || i != LastInputIndex) {
@@ -136,15 +139,15 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
             do {
                 AppliedOffset += Funcs.Data[--F].InputCount;
                 ScopedOffset += Output.Data[Funcs.Data[F].Index].InputID;
-             } while (F && Funcs.Data[F].PrevIndex == 0 && AppliedOffset + ScopedOffset <= Output.Data[i].InputID);
+             } while (Funcs.Data[F].PrevIndex == 0 && AppliedOffset + ScopedOffset <= Output.Data[i].InputID);
             ScopedOffset += AppliedOffset;
 
             // Detects sentinel values for unapplied bound variables and free variables
             int BoundID = Output.Data[i].InputID - ScopedOffset + Output.Data[Funcs.Data[F].Index].InputID + Funcs.Data[F].InputCount;
-            if (F == 0 || Funcs.Data[F].PrevIndex || BoundID >= Funcs.Data[F].InputCount) {
+            if (Funcs.Data[F].PrevIndex || BoundID >= Funcs.Data[F].InputCount) {
                 // Unapplied bound variables cannot be reduced so the applied variable count decreases their bound ID instead
                 // Free variables do not need separate parsing when not evaluating arguments
-                if (Funcs.Data[F].PrevIndex == 0) {
+                if (F == 0 || Funcs.Data[F].PrevIndex == 0) {
                     Output.Data[i++].InputID -= AppliedOffset;
                     continue;
                 }
@@ -190,7 +193,7 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
                         do {
                             AppliedOffset += Funcs.Data[--F].InputCount;
                             ScopedOffset += Output.Data[Funcs.Data[F].Index].InputID;
-                        } while (F && Funcs.Data[F].PrevIndex == 0 && ScopedOffset <= Output.Data[j].InputID);
+                        } while (Funcs.Data[F].PrevIndex == 0 && ScopedOffset <= Output.Data[j].InputID);
 
                         // Increases previous InputID with the new potential arguments
                         // if (F2 == LastF) AppliedOffset -= Funcs.Data[LastF].InputCount;
@@ -212,7 +215,10 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
             }
 
             // The lazy reduction strategy parses arguments right before reduction
-            int ArgumentIndex = FuncArgs.Data[Funcs.Data[F].ArgumentIndex + BoundID].Index;
+            int ArgumentIndex = Funcs.Data[F].Index;
+            for (int j = 0; j < FuncArgs.Data[Funcs.Data[F].ArgumentIndex + BoundID].Offset; j++)
+                ArgumentIndex += Output.Data[ArgumentIndex].Size;
+
             if (FuncArgs.Data[Funcs.Data[F].ArgumentIndex + BoundID].IsReduced == 0) {
                 // The previous index is a sentinel that stores the reduction position
                 if (ResizeArray(&Funcs, (++Funcs.Size + 1) * sizeof (FuncStack))) goto CallFuncDefer;
@@ -231,8 +237,14 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
 
             // Variables free to arguments need to skip arguments applied to previous abstractions so the scoped argument count is updated
             PROFILE_NAMED("Bound variable evaluation");
-            for (int j = F - 1; j && Funcs.Data[j].PrevIndex == 0 && FuncArgs.Data[Funcs.Data[j].ArgumentIndex].Index < ArgumentIndex; j--)
+            for (int j = F - 1; Funcs.Data[j].PrevIndex == 0; j--) {
+                int Index = Funcs.Data[j].Index;
+                for (int k = 0; k < FuncArgs.Data[Funcs.Data[k].ArgumentIndex].Offset; k++)
+                    Index += Output.Data[Index].Size;
+
+                if (Index >= ArgumentIndex) break;
                 ScopedOffset += Funcs.Data[j].InputCount;
+            } 
 
             // Resizes the output buffer to fit the reduced argument
             int SizeOffset = Output.Data[ArgumentIndex].Size - 1;
@@ -272,7 +284,7 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
 
             // Updates size and positions from applying a beta reduction
             Output.Size += SizeOffset;            
-            if (SizeOffset) UpdateFuncSize(Output.Data, FuncArgs.Data, FuncArgs.Size, i, SizeOffset);
+            if (SizeOffset) UpdateFuncSize(Output.Data, i, SizeOffset);
             PROFILE_END();
     	}
 
@@ -284,7 +296,7 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
                 Output.Size--;
                 memmove(Output.Data + i, Output.Data + i + 1, (Output.Size - i) * sizeof (Func));
 
-                UpdateFuncSize(Output.Data, FuncArgs.Data, FuncArgs.Size, i, -1);
+                UpdateFuncSize(Output.Data, i, -1);
                 PROFILE_END();
             } else i++;
         }
@@ -327,7 +339,7 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
                 SearchIndex = MaxIndex;
             }
 
-            for (int I = i; Output.Data[i].InputID;) {
+            for (int I = i, Offset = 0; Output.Data[i].InputID;) {
                 // Cannot update the current function with arguments of previously applied functions
                 if (F == 0 ? I + Output.Data[I].Size >= Output.Size : I + Output.Data[I].Size >= SearchIndex) {
                     int ArgumentCount = 0;
@@ -337,9 +349,10 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
                     do {
                         if (F == 0 ? I + Output.Data[I].Size >= Output.Size : I + Output.Data[I].Size >= SearchIndex) {
                             ArgumentCount += Funcs.Data[F].InputCount;
+                            Offset += Funcs.Data[F].InputCount;
 
                             // Cannot apply arguments that do not exist or are outside the range of an known or potential argument
-                            if (F == 0 || Funcs.Data[F].PrevIndex || Funcs.Data[F].InputCount == 0) {
+                            if (Funcs.Data[F].InputCount == 0) {
                                 NextScope = 1;
                                 break;
                             }
@@ -369,7 +382,7 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
                 if (ResizeArray(&FuncArgs, (FuncArgs.Size + 1) * sizeof (FuncArg))) goto CallFuncDefer;
                 FuncArgs.Data[FuncArgs.Size++] = (FuncArg) {
                     .IsReduced = 0,
-                    .Index = I
+                    .Offset = ++Offset
                 };
             }
             

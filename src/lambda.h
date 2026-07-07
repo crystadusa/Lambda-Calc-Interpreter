@@ -70,7 +70,7 @@ typedef struct {
 
 typedef struct {
     int IsReduced;
-    int Index;
+    int Offset;
 } FuncArg;
 
 typedef struct {
@@ -85,7 +85,7 @@ Array(Abstraction);
 
 // Function prototypes
 int ResizeArray(void*, int);
-void UpdateFuncSize(Func*, FuncArg*, int, int, int);
+void UpdateFuncSize(Func*, int, int);
 int CallFunc(Func*, int, FuncArray*, int);
 int IntToChars(char*, int);
 void test(void);
