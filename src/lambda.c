@@ -1,5 +1,12 @@
 #include "lambda.h"
 
+void* Profile_memmove(void* Dst, void const* Src, size_t Size) {
+    PROFILE_NAMED("memmove");
+    void* Res = memmove(Dst, Src, Size);
+    PROFILE_END();
+    return Res;
+}
+
 int ResizeArray(void* DynArray, int Size) {
     Array* Data = (Array*) 1;
     Array* Array = DynArray;
@@ -82,8 +89,15 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
 
                 // Updates size and positions from removing arguments
                 LastInputIndex += Output.Data[LastInputIndex].Size;
-                for (int j = i; j < LastInputIndex; j += Output.Data[j].Size)
-                    UpdateFuncSize(Output.Data, i, -Output.Data[j].Size);
+
+                PROFILE_NAMED("UpdateFuncSize");
+                for (int j = 0; j < i; j++)
+                    if (Output.Data[j].Size > i - j) {
+                        int SizeOffset = LastInputIndex - i;
+                        if (SizeOffset > Output.Data[j].Size + j - i) SizeOffset = Output.Data[j].Size + j - i;
+                        Output.Data[j].Size -= SizeOffset;
+                    }
+                PROFILE_END();
             }
 
             // Calculates the number of preceding groupings ending before or at the end of the current function
@@ -111,9 +125,8 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
             // Removes groupings and arguments from the output buffer
             if (GroupingCount || i != LastInputIndex) {
                 i -= GroupingCount;
-                memmove(Output.Data + UpdateIndex, Output.Data + UpdateIndex + GroupingCount, (i - UpdateIndex) * sizeof (Func));
-                memmove(Output.Data + i, Output.Data + LastInputIndex, (Output.Size - LastInputIndex) * sizeof (Func));
-
+                Profile_memmove(Output.Data + UpdateIndex, Output.Data + UpdateIndex + GroupingCount, (i - UpdateIndex) * sizeof (Func));
+                Profile_memmove(Output.Data + i, Output.Data + LastInputIndex, (Output.Size - LastInputIndex) * sizeof (Func));
                 Output.Size += i - LastInputIndex;
             }
         
@@ -252,9 +265,7 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
             ArgumentIndex += SizeOffset;
 
             // Shifts all terms after the reduction position to fit the reduced argument
-            PROFILE_CONTEXT("memmove", __memmove);
-            if (SizeOffset) memmove(Output.Data + i + SizeOffset, Output.Data + i, (Output.Size - i) * sizeof (Func));
-            PROFILE_END_CONTEXT(__memmove);
+            if (SizeOffset) Profile_memmove(Output.Data + i + SizeOffset, Output.Data + i, (Output.Size - i) * sizeof (Func));
 
             // Applies a beta reduction
             int ReductionIndex = i;
@@ -294,7 +305,7 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
                 // Removes groupings when they end where the following sized term ends
                 PROFILE_NAMED("Grouping evaluation");
                 Output.Size--;
-                memmove(Output.Data + i, Output.Data + i + 1, (Output.Size - i) * sizeof (Func));
+                Profile_memmove(Output.Data + i, Output.Data + i + 1, (Output.Size - i) * sizeof (Func));
 
                 UpdateFuncSize(Output.Data, i, -1);
                 PROFILE_END();
@@ -397,7 +408,7 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
 	for (int i = 0; i < Output.Size;)
        	if ((i == 0 || Output.Data[i - 1].Size != 1) && Output.Data[i].Size != 1 && Output.Data[i].InputID == 0) {
         	Output.Size--;
-            memmove(Output.Data + i, Output.Data + i + 1, (Output.Size - i) * sizeof (Func));
+            Profile_memmove(Output.Data + i, Output.Data + i + 1, (Output.Size - i) * sizeof (Func));
           	 
            	for (int j = 0; j < i; j++)
             	if (Output.Data[j].Size > i - j)
@@ -440,7 +451,7 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
    	 
             // Removes the remaining abstraction term
         	Output.Size--;
-            memmove(Output.Data + i + 1, Output.Data + i + 2, (Output.Size - i - 1) * sizeof (Func));
+            Profile_memmove(Output.Data + i + 1, Output.Data + i + 2, (Output.Size - i - 1) * sizeof (Func));
           	 
            	for (int j = 0; j < i; j++)
             	if (Output.Data[j].Size > i - j)
