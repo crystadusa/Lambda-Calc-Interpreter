@@ -62,7 +62,28 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
     FuncArgArray FuncArgs = {0};
 	FuncStackArray Funcs = {0};
     if (ResizeArray(&Abstractions, START_BUFFER_SIZE) || ResizeArray(&FuncArgs, START_BUFFER_SIZE) || ResizeArray(&Funcs, START_BUFFER_SIZE)) goto CallFuncDefer;
-    
+
+    // Validates the incoming lambda terms
+    int SizedIndex = 0;
+    int* SizedEnds = (int*) Abstractions.Data;
+    SizedEnds[0] = Output.Size;
+
+    for (int i = 0; i < Output.Size; i++) {
+        // Decreases the scope offset at the end of a sized term
+        while (i >= SizedEnds[SizedIndex])
+            SizedIndex--;
+
+        // Size cannot be zero, no field can be negative, and sized terms cannot extend beyond the last sized term
+        if (Output.Data[i].Size < 1 || Output.Data[i].InputID < 0) goto CallFuncDefer;
+        if (i + Output.Data[i].Size > SizedEnds[SizedIndex]) goto CallFuncDefer;
+        
+        // Increases the scope offset when parsing a sized term
+        if (Output.Data[i].Size != 1) {
+            if (ResizeArray(&Abstractions, (++SizedIndex + 1) * sizeof (Abstraction))) goto CallFuncDefer;
+            SizedEnds[SizedIndex] = i + Output.Data[i].Size;
+        }
+    }
+
     // Initializes a sentinel for function lookups
     Funcs.Data[0] = (FuncStack) {.PrevIndex = 1};
 	
@@ -139,6 +160,7 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
             Funcs.Size -= FuncOffset;
             Funcs.Size--;
             FuncArgs.Size = Funcs.Data[Funcs.Size].ArgumentIndex + Funcs.Data[Funcs.Size].InputCount;
+            if (PostFreeVariable) i = Funcs.Data[Funcs.Size].Index + Output.Data[Funcs.Data[Funcs.Size].Index].Size;
             PROFILE_END();
     	}
     	
@@ -165,18 +187,9 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
                     continue;
                 }
 
-                // Potential arguments do not need to be removed again
-                if (PostFreeVariable) {
-                    i++;
-                    continue;
-                }
-
-                // Finds the last function that is not a grouping
-                PROFILE_NAMED("Free variable evaluation");
-                int LastF = Funcs.Size;
-
                 // Free variables may later become bound when evaluating arguments
                 // So Input IDs must be updated to remove potential arguments from functions
+                PROFILE_NAMED("Free variable evaluation");
                 int StackIndex = 0;
                 Abstractions.Data[0] = (Abstraction) {
                     .ScopeOffset = 0,
@@ -191,7 +204,7 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
 
                     // Tracks the most recent function to later sum their input counts
                     // Increases the scope offset when parsing an abstraction
-                    if (ScopeF < LastF && Funcs.Data[ScopeF + 1].Index == j) ScopeF++;
+                    if (ScopeF < Funcs.Size && Funcs.Data[ScopeF + 1].Index == j) ScopeF++;
                     else if (Output.Data[j].Size > 1 && Output.Data[j].InputID) {
                         if (ResizeArray(&Abstractions, (++StackIndex + 1) * sizeof (Abstraction))) goto CallFuncDefer;
                         Abstractions.Data[StackIndex].ScopeOffset = Abstractions.Data[StackIndex - 1].ScopeOffset + Output.Data[j].InputID;
@@ -209,20 +222,18 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
                         } while (Funcs.Data[F].PrevIndex == 0 && ScopedOffset <= Output.Data[j].InputID);
 
                         // Increases previous InputID with the new potential arguments
-                        // if (F2 == LastF) AppliedOffset -= Funcs.Data[LastF].InputCount;
                         Output.Data[j].InputID += AppliedOffset;
                     }
                 }
 
                 // Removes inputs because they are now potential arguments of a free variable
-                for (int j = F; j <= LastF; j++) {
+                for (int j = F; j <= Funcs.Size; j++) {
                     Output.Data[Funcs.Data[j].Index].InputID += Funcs.Data[j].InputCount;
                     Funcs.Data[j].InputCount = 0;
                 }
 
                 PostFreeVariable = 1;
-                // Output.Data[i++].InputID -= Funcs.Data[LastF].InputCount;
-                i++;
+                i = Funcs.Data[Funcs.Size].Index + Output.Data[Funcs.Data[Funcs.Size].Index].Size;
                 PROFILE_END();
                 continue;
             }
@@ -232,7 +243,7 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
             for (int j = 0; j < FuncArgs.Data[Funcs.Data[F].ArgumentIndex + BoundID].Offset; j++)
                 ArgumentIndex += Output.Data[ArgumentIndex].Size;
 
-            if (FuncArgs.Data[Funcs.Data[F].ArgumentIndex + BoundID].IsReduced == 0) {
+            if (Output.Data[ArgumentIndex].Size > 1 && FuncArgs.Data[Funcs.Data[F].ArgumentIndex + BoundID].IsReduced == 0) {
                 // The previous index is a sentinel that stores the reduction position
                 if (ResizeArray(&Funcs, (++Funcs.Size + 1) * sizeof (FuncStack))) goto CallFuncDefer;
                 Funcs.Data[Funcs.Size] = (FuncStack) {
@@ -257,7 +268,15 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
 
                 if (Index >= ArgumentIndex) break;
                 ScopedOffset += Funcs.Data[j].InputCount;
-            } 
+            }
+
+            // Simplifies the reduction when the argument is not a sized term
+            if (Output.Data[ArgumentIndex].Size == 1) {
+                Output.Data[i] = Output.Data[ArgumentIndex];
+                Output.Data[i].InputID += ScopedOffset;
+                PROFILE_END();
+                continue;
+            }
 
             // Resizes the output buffer to fit the reduced argument
             int SizeOffset = Output.Data[ArgumentIndex].Size - 1;
@@ -265,7 +284,7 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
             ArgumentIndex += SizeOffset;
 
             // Shifts all terms after the reduction position to fit the reduced argument
-            if (SizeOffset) Profile_memmove(Output.Data + i + SizeOffset, Output.Data + i, (Output.Size - i) * sizeof (Func));
+            Profile_memmove(Output.Data + i + SizeOffset, Output.Data + i, (Output.Size - i) * sizeof (Func));
 
             // Applies a beta reduction
             int ReductionIndex = i;
@@ -295,7 +314,7 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
 
             // Updates size and positions from applying a beta reduction
             Output.Size += SizeOffset;            
-            if (SizeOffset) UpdateFuncSize(Output.Data, i, SizeOffset);
+            UpdateFuncSize(Output.Data, i, SizeOffset);
             PROFILE_END();
     	}
 
@@ -322,12 +341,6 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
                 .ArgumentIndex = FuncArgs.Size,
                 .PrevIndex = 0,
             };
-
-            // Potential arguments of a free variable cannot reduce when evaluating arguments
-            if (PostFreeVariable) {
-                i++;
-                continue;
-            }
             
             // Potential arguments cannot reduce variables bound to other potential arguments
             // The index of the sized term bounding the argument search is capped at the previous variable
@@ -496,7 +509,6 @@ int IntToChars(char* OutChars, int InNum) {
     return Digits;
 }
 
-// TODO file and lambda validation
 int main(int argc, char** argv) {
     // Reads the input and output file paths
     char* InFilePath = 0;
@@ -621,6 +633,10 @@ int main(int argc, char** argv) {
     int* TermMem;
     int TermCount = 0;
     if (InFileIsBinary) {
+        if (InFileSize % sizeof (int)) {
+            puts("Error: The last term in the binary file is cropped");
+            return 1;
+        }
         TermMem = (int*) FileMem;
         TermCount = InFileSize / sizeof (int);
     }
