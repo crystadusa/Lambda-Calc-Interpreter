@@ -125,7 +125,7 @@ int CallFunc(Func* Called, int CalledCount, FuncArray* OutBuffer, int MaxRecursi
             int GroupingCount = 0;            
             int FuncOffset = 0;
             int UpdateIndex = Funcs.Data[Funcs.Size].Index;
-            for (int F = Funcs.Size;; GroupingCount++, UpdateIndex--) {
+            for (int F = Funcs.Size; UpdateIndex; GroupingCount++, UpdateIndex--) {
                 if (Output.Data[UpdateIndex - 1].Size < 2 || Output.Data[UpdateIndex - 1].InputID) break;
                 if (UpdateIndex - 1 == Funcs.Data[F - 1].Index && Funcs.Data[F - 1].InputCount) break;
                 if (i < UpdateIndex - 1 + Output.Data[UpdateIndex - 1].Size) break;
@@ -638,7 +638,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         TermMem = (int*) FileMem;
-        TermCount = InFileSize / sizeof (int);
+        TermCount = InFileSize / (int) sizeof (int);
     }
 
     // Parses text with numbers separated by white space as lambda terms
